@@ -3,7 +3,7 @@
    <h1>
       KiwiOS
    </h1>
-   KiwiOS is a simple LFS system written to be fast, beautiful, and free of bloatware.
+   KiwiOS is a simple from-scratch Monolithic OS.
 </div>
 <br>
    
