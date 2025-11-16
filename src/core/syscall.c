@@ -243,6 +243,11 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                 retval = (uint64_t)-1;
                 break;
             }
+
+            if (proc->fb_mapping_size != 0) {
+                retval = proc->fb_mapping_virt_base;
+                break;
+            }
             
             // Calculate how many pages we need
             uint64_t fb_size = fb->pitch * fb->height;
@@ -284,6 +289,10 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             }
             
             if (success) {
+                uint64_t mapped_size = pages_needed * PAGE_SIZE;
+                proc->fb_mapping_phys_base = fb_phys;
+                proc->fb_mapping_size = mapped_size;
+                proc->fb_mapping_virt_base = virt_addr;
                 retval = virt_addr;
             } else {
                 retval = (uint64_t)-1;
@@ -330,34 +339,51 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             if (new_end_page > old_end_page) {
                 // Growing heap - need to allocate and map new pages
                 uint64_t pages_needed = (new_end_page - old_end_page) / PAGE_SIZE;
-                
+                bool grow_ok = true;
+                uint64_t pages_allocated = 0;
+
                 for (uint64_t i = 0; i < pages_needed; i++) {
                     uint64_t virt_addr = old_end_page + (i * PAGE_SIZE);
                     uint64_t phys_page = (uint64_t)pmm_alloc();
-                    
+
                     if (!phys_page) {
-                        // Out of memory - return current heap end
-                        retval = proc->heap_end;
+                        grow_ok = false;
                         break;
                     }
-                    
+
                     if (!vmm_map_page(proc->page_table, virt_addr, phys_page,
                                     PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
                         // Mapping failed - free the page and return
                         pmm_free((void*)phys_page);
-                        retval = proc->heap_end;
+                        grow_ok = false;
                         break;
                     }
-                    
+
                     // Zero out the new page
                     uint8_t* page_virt = (uint8_t*)phys_to_virt(phys_page);
                     memset(page_virt, 0, PAGE_SIZE);
+
+                    pages_allocated++;
                 }
-                
+
+                if (!grow_ok) {
+                    for (uint64_t j = 0; j < pages_allocated; j++) {
+                        uint64_t virt_addr = old_end_page + (j * PAGE_SIZE);
+                        uint64_t phys = vmm_get_physical(proc->page_table, virt_addr);
+                        if (phys) {
+                            vmm_unmap_page(proc->page_table, virt_addr);
+                            pmm_free((void*)phys);
+                        }
+                    }
+
+                    retval = proc->heap_end;
+                    break;
+                }
+
                 // Update heap end
                 proc->heap_end = new_end;
                 retval = new_end;
-                
+
             } else if (new_end_page < old_end_page) {
                 // Shrinking heap - unmap pages
                 uint64_t pages_to_free = (old_end_page - new_end_page) / PAGE_SIZE;

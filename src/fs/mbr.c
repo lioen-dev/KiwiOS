@@ -1,8 +1,7 @@
 #include "fs/mbr.h"
 #include "drivers/blockdev.h"
 #include "lib/string.h"
-
-static block_device_t g_part;
+#include "memory/heap.h"
 
 block_device_t* mbr_open_first_partition(block_device_t* parent) {
     if (!parent) return 0;
@@ -22,20 +21,40 @@ block_device_t* mbr_open_first_partition(block_device_t* parent) {
     }
     if (chosen < 0) return 0;
 
-        // Build a child name based on parent, e.g., "<parent>pN"
-    static char pname[32];
-    char* pn = pname;
+    block_device_t* child = (block_device_t*)kmalloc(sizeof(block_device_t));
+    if (!child) {
+        return 0;
+    }
+
+    memset(child, 0, sizeof(block_device_t));
+
     const char* src = parent->name ? parent->name : "disk";
-    while (*src && (pn - pname) < (int)sizeof(pname) - 3) *pn++ = *src++;
-    *pn++ = 'p'; *pn++ = (char)('1' + chosen); *pn = 0;
-    g_part.name = pname;
-    g_part.unit = parent->unit;
-    g_part.total_sectors = m.parts[chosen].lba_count;
-    g_part.base_lba = (uint64_t)m.parts[chosen].lba_first + parent->base_lba;
-    g_part.driver_data = parent->driver_data;
-    g_part.read = parent->read;
-    g_part.write = parent->write;
-    g_part.next = 0;
-    blockdev_register(&g_part);
-    return &g_part;
+    size_t base_len = strlen(src);
+    if (base_len > 28) {
+        base_len = 28;
+    }
+
+    size_t name_len = base_len + 2; // room for "p" + digit
+    char* pname = (char*)kmalloc(name_len + 1);
+    if (!pname) {
+        kfree(child);
+        return 0;
+    }
+
+    memcpy(pname, src, base_len);
+    pname[base_len] = 'p';
+    pname[base_len + 1] = (char)('1' + chosen);
+    pname[base_len + 2] = '\0';
+
+    child->name = pname;
+    child->unit = parent->unit;
+    child->total_sectors = m.parts[chosen].lba_count;
+    child->base_lba = (uint64_t)m.parts[chosen].lba_first + parent->base_lba;
+    child->driver_data = parent->driver_data;
+    child->read = parent->read;
+    child->write = parent->write;
+    child->next = 0;
+
+    blockdev_register(child);
+    return child;
 }

@@ -12,6 +12,23 @@ static uint32_t next_pid = 1;
 
 extern void switch_context(context_t* old_ctx, context_t* new_ctx);
 
+static bool process_phys_is_reserved(process_t* proc, uint64_t phys) {
+    if (!proc || proc->fb_mapping_size == 0) {
+        return false;
+    }
+
+    uint64_t start = proc->fb_mapping_phys_base;
+    uint64_t size = proc->fb_mapping_size;
+    uint64_t end = start + size;
+
+    if (end < start) {
+        // Overflow - treat as not reserved
+        return false;
+    }
+
+    return phys >= start && phys < end;
+}
+
 void process_init(void) {
     process_t* idle = (process_t*)kmalloc(sizeof(process_t));
     if (!idle) return;
@@ -213,7 +230,7 @@ void process_destroy(process_t* proc) {
             for (int i = 0; i < 4; i++) {
                 uint64_t virt = user_stack_base + (i * PAGE_SIZE);
                 uint64_t phys = vmm_get_physical(proc->page_table, virt);
-                if (phys) {
+                if (phys && !process_phys_is_reserved(proc, phys)) {
                     pmm_free((void*)phys);
                 }
             }
@@ -226,7 +243,7 @@ void process_destroy(process_t* proc) {
         for (uint64_t i = 0; i < heap_pages; i++) {
             uint64_t virt = proc->heap_start + (i * PAGE_SIZE);
             uint64_t phys = vmm_get_physical(proc->page_table, virt);
-            if (phys) {
+            if (phys && !process_phys_is_reserved(proc, phys)) {
                 pmm_free((void*)phys);
             }
         }
@@ -259,12 +276,14 @@ void process_destroy(process_t* proc) {
                         
                         // Skip stack and heap regions
                         if (virt >= proc->heap_start && virt < proc->heap_end) continue;
-                        if (proc->user_stack_top && 
-                            virt >= (proc->user_stack_top - (4 * PAGE_SIZE)) && 
+                        if (proc->user_stack_top &&
+                            virt >= (proc->user_stack_top - (4 * PAGE_SIZE)) &&
                             virt < proc->user_stack_top) continue;
-                        
+
                         uint64_t phys = pt[pt_idx] & 0x000FFFFFFFFFF000ULL;
-                        pmm_free((void*)phys);
+                        if (!process_phys_is_reserved(proc, phys)) {
+                            pmm_free((void*)phys);
+                        }
                     }
                 }
             }

@@ -163,6 +163,10 @@ void kfree(void* ptr) {
 }
 
 void* kcalloc(size_t num, size_t size) {
+    if (num != 0 && size > SIZE_MAX / num) {
+        return NULL;
+    }
+
     size_t total = num * size;
     void* ptr = kmalloc(total);
     if (ptr) {
