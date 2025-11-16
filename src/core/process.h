@@ -47,6 +47,11 @@ typedef struct process {
     bool is_usermode;                      // True if this runs in ring 3
     bool has_been_interrupted;             // True after first timer interrupt
 
+    // Track device mappings that must not be returned to the PMM
+    uint64_t fb_mapping_phys_base;
+    uint64_t fb_mapping_size;
+    uint64_t fb_mapping_virt_base;
+
     uint64_t start_ticks;                  // Ticks at process start (for timing)
 
     struct process* next;
