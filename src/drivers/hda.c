@@ -123,8 +123,7 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
-#define HDA_POWER_STATE_D0 0x00
-#define HDA_POWER_STATE_D3 0x03
+#define HDA_VERB_GET_POWER_STATE 0xF05
 
 // HDA controller state
 typedef struct {
@@ -452,6 +451,19 @@ static bool hda_send_verb_corb(uint8_t codec, uint8_t node,
     return false; // timeout waiting for RIRB response
 }
 
+// Try CORB first (if configured) and fall back to Immediate Command on failure.
+static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
+                                         uint16_t verb, uint16_t payload,
+                                         uint32_t* out_resp) {
+    if (g_hda.corb_rirb_ok) {
+        if (hda_send_verb_corb(codec, node, verb, payload, out_resp)) {
+            return true;
+        }
+    }
+
+    return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
+}
+
 
 // -------------------- Public API: init --------------------
 
@@ -528,33 +540,14 @@ bool hda_get_codec0_vendor_immediate(uint32_t* out_vendor) {
     uint16_t mask = g_hda.codec_mask;
     uint32_t resp = 0;
 
-    // 1) First pass: use CORB/RIRB for any codec that has a bit set.
-    if (g_hda.corb_rirb_ok) {
-        for (uint8_t c = 0; c < 15; c++) {
-            if (!(mask & (1u << c)))
-                continue;
-
-            if (hda_send_verb_corb(c, 0,
-                                   HDA_VERB_GET_PARAMETER,
-                                   HDA_PARAM_VENDOR_ID,
-                                   &resp)) {
-                if (out_vendor)
-                    *out_vendor = resp;
-                g_hda.primary_codec = c;
-                return true;
-            }
-        }
-    }
-
-    // 2) Second pass: fall back to Immediate Command for each codec.
     for (uint8_t c = 0; c < 15; c++) {
         if (!(mask & (1u << c)))
             continue;
 
-        if (hda_send_verb_immediate(c, 0,
-                                    HDA_VERB_GET_PARAMETER,
-                                    HDA_PARAM_VENDOR_ID,
-                                    &resp)) {
+        if (hda_send_verb_best_available(c, 0,
+                                         HDA_VERB_GET_PARAMETER,
+                                         HDA_PARAM_VENDOR_ID,
+                                         &resp)) {
             if (out_vendor)
                 *out_vendor = resp;
             g_hda.primary_codec = c;
@@ -576,10 +569,10 @@ bool hda_codec0_get_sub_nodes(uint8_t parent_nid,
     uint8_t codec = g_hda.primary_codec;
     uint32_t resp = 0;
 
-    if (!hda_send_verb_immediate(codec, parent_nid,
-                                 HDA_VERB_GET_PARAMETER,
-                                 HDA_PARAM_NODE_COUNT,
-                                 &resp)) {
+    if (!hda_send_verb_best_available(codec, parent_nid,
+                                      HDA_VERB_GET_PARAMETER,
+                                      HDA_PARAM_NODE_COUNT,
+                                      &resp)) {
         return false;
     }
 
@@ -588,6 +581,41 @@ bool hda_codec0_get_sub_nodes(uint8_t parent_nid,
 
     if (out_start) *out_start = start;
     if (out_count) *out_count = count;
+    return true;
+}
+
+bool hda_codec0_get_parameter(uint8_t nid, uint16_t parameter, uint32_t* out_resp) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    uint8_t codec = g_hda.primary_codec;
+    return hda_send_verb_best_available(codec, nid,
+                                        HDA_VERB_GET_PARAMETER,
+                                        parameter,
+                                        out_resp);
+}
+
+bool hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+
+    if (!hda_send_verb_best_available(codec, nid,
+                                      HDA_VERB_SET_POWER_STATE,
+                                      target_state,
+                                      &resp)) {
+        return false;
+    }
+
+    uint8_t current = (uint8_t)(resp & 0x0F);
+    if (out_state) {
+        *out_state = current;
+    }
+
     return true;
 }
 
