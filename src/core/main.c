@@ -1913,37 +1913,46 @@ void kmain(void) {
             hx4(fb0(), (uint16_t)(vendor & 0xFFFF));
             print(fb0(), ")\n");
 
-                // After printing codec0 vendor, ask for its root node children
-        uint8_t start_nid = 0;
-        uint8_t node_count = 0;
-        if (hda_codec0_get_sub_nodes(0, &start_nid, &node_count)) {
-            print(fb0(), "HDA: codec0 root has ");
-            print_u32(fb0(), node_count);
-            print(fb0(), " nodes starting at NID ");
-            print_u32(fb0(), start_nid);
-            print(fb0(), "\n");
-        } else {
-            print(fb0(), "HDA: failed to read codec0 root node range\n");
-        }
+            uint8_t powered_state = 0xFF;
+            if (hda_codec0_set_power_state(0, HDA_POWER_STATE_D0, &powered_state)) {
+                print(fb0(), "HDA: codec0 root entered power state D");
+                print_u32(fb0(), powered_state);
+                print(fb0(), "\n");
+            } else {
+                print(fb0(), "HDA: failed to set codec0 root power state\n");
+            }
 
-        // Now ask the Audio Function Group (NID 1) what *its* children are.
-        uint8_t afg_first = 0;
-        uint8_t afg_count = 0;
-        if (hda_codec0_get_sub_nodes(1, &afg_first, &afg_count)) {
-            print(fb0(), "HDA: AFG NID 1 has ");
-            print_u32(fb0(), afg_count);
-            print(fb0(), " widgets starting at NID ");
-            print_u32(fb0(), afg_first);
-            print(fb0(), "\n");
-        } else {
-            print(fb0(), "HDA: failed to read AFG (NID 1) widget range\n");
-        }
+            // After printing codec0 vendor, ask for its root node children
+            uint8_t start_nid = 0;
+            uint8_t node_count = 0;
+            if (hda_codec0_get_sub_nodes(0, &start_nid, &node_count)) {
+                print(fb0(), "HDA: codec0 root has ");
+                print_u32(fb0(), node_count);
+                print(fb0(), " nodes starting at NID ");
+                print_u32(fb0(), start_nid);
+                print(fb0(), "\n");
+            } else {
+                print(fb0(), "HDA: failed to read codec0 root node range\n");
+            }
+
+            // Now ask the Audio Function Group (NID 1) what *its* children are.
+            uint8_t afg_first = 0;
+            uint8_t afg_count = 0;
+            if (hda_codec0_get_sub_nodes(1, &afg_first, &afg_count)) {
+                print(fb0(), "HDA: AFG NID 1 has ");
+                print_u32(fb0(), afg_count);
+                print(fb0(), " widgets starting at NID ");
+                print_u32(fb0(), afg_first);
+                print(fb0(), "\n");
+            } else {
+                print(fb0(), "HDA: failed to read AFG (NID 1) widget range\n");
+            }
 
         } else {
             print(fb0(), "HDA: failed to read codec0 vendor ID (immediate)\n");
         }
 
-                // after printing reset status, before or after vendor read:
+        // after printing reset status, before or after vendor read:
         if (hda_has_codec()) {
             print(fb0(), "HDA: codec mask = 0x");
             hx4(fb0(), hda_get_codec_mask());

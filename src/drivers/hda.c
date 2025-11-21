@@ -123,8 +123,7 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
-#define HDA_POWER_STATE_D0 0x00
-#define HDA_POWER_STATE_D3 0x03
+#define HDA_VERB_GET_POWER_STATE 0xF05
 
 // HDA controller state
 typedef struct {
@@ -305,9 +304,24 @@ static bool hda_reset_controller(void) {
 static void hda_discover_codecs(void) {
     if (!g_hda.present || !g_hda.mmio_base) return;
 
-    // STATESTS bits [0..14] indicate codec presence
-    uint16_t mask = hda_mmio_read16(HDA_REG_STATESTS);
+    // STATESTS bits [0..14] indicate codec presence. On some real hardware the
+    // bits can take a little longer to assert after controller reset, so give
+    // them a modest grace period before concluding nothing is present.
+    uint64_t deadline = hda_deadline_ms(500);
+    uint16_t mask = 0;
+    while (timer_get_ticks() <= deadline) {
+        mask = hda_mmio_read16(HDA_REG_STATESTS) & 0x7FFFu;
+        if (mask != 0) break;
+        __asm__ volatile("pause");
+    }
+
     g_hda.codec_mask = mask;
+
+    // Clear any latched presence-change bits that may have accumulated during
+    // reset so subsequent hotplug/change events are visible.
+    if (mask) {
+        hda_mmio_write16(HDA_REG_STATESTS, mask);
+    }
 
     if (mask == 0) {
         g_hda.codec_present = false;
@@ -452,6 +466,19 @@ static bool hda_send_verb_corb(uint8_t codec, uint8_t node,
     return false; // timeout waiting for RIRB response
 }
 
+// Try CORB first (if configured) and fall back to Immediate Command on failure.
+static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
+                                         uint16_t verb, uint16_t payload,
+                                         uint32_t* out_resp) {
+    if (g_hda.corb_rirb_ok) {
+        if (hda_send_verb_corb(codec, node, verb, payload, out_resp)) {
+            return true;
+        }
+    }
+
+    return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
+}
+
 
 // -------------------- Public API: init --------------------
 
@@ -467,14 +494,20 @@ bool hda_init(void) {
     // 2) Enable MMIO + bus mastering for this controller
     pci_enable_mmio_and_bus_mastering(dev.bus, dev.slot, dev.func);
 
-    // 3) Read BAR0 (MMIO base)
+    // 3) Read BAR0/BAR1 (MMIO base)
     uint32_t bar0 = pci_config_read32(dev.bus, dev.slot, dev.func, 0x10);
     if (bar0 & 1) { // IO-space BAR? shouldn't happen for HDA
         g_hda.present = false;
         return false;
     }
 
-    uintptr_t phys_base = (uintptr_t)(bar0 & ~0xFu);
+    bool bar0_is_64 = ((bar0 >> 1) & 0x3) == 0x2;
+    uint32_t bar1 = 0;
+    if (bar0_is_64) {
+        bar1 = pci_config_read32(dev.bus, dev.slot, dev.func, 0x14);
+    }
+
+    uint64_t phys_base = ((uint64_t)bar1 << 32) | (uint64_t)(bar0 & ~0xFu);
     if (!phys_base) {
         g_hda.present = false;
         return false;
@@ -482,7 +515,7 @@ bool hda_init(void) {
 
     // Map MMIO BAR into the kernel's address space as uncached MMIO.
     // Intel HDA typically exposes up to 16KiB of registers; 0x4000 is safe.
-    void* mmio = hda_map_mmio_uncached((uint64_t)phys_base, 0x4000);
+    void* mmio = hda_map_mmio_uncached(phys_base, 0x4000);
     if (!mmio) {
         g_hda.present = false;
         return false;
@@ -528,33 +561,14 @@ bool hda_get_codec0_vendor_immediate(uint32_t* out_vendor) {
     uint16_t mask = g_hda.codec_mask;
     uint32_t resp = 0;
 
-    // 1) First pass: use CORB/RIRB for any codec that has a bit set.
-    if (g_hda.corb_rirb_ok) {
-        for (uint8_t c = 0; c < 15; c++) {
-            if (!(mask & (1u << c)))
-                continue;
-
-            if (hda_send_verb_corb(c, 0,
-                                   HDA_VERB_GET_PARAMETER,
-                                   HDA_PARAM_VENDOR_ID,
-                                   &resp)) {
-                if (out_vendor)
-                    *out_vendor = resp;
-                g_hda.primary_codec = c;
-                return true;
-            }
-        }
-    }
-
-    // 2) Second pass: fall back to Immediate Command for each codec.
     for (uint8_t c = 0; c < 15; c++) {
         if (!(mask & (1u << c)))
             continue;
 
-        if (hda_send_verb_immediate(c, 0,
-                                    HDA_VERB_GET_PARAMETER,
-                                    HDA_PARAM_VENDOR_ID,
-                                    &resp)) {
+        if (hda_send_verb_best_available(c, 0,
+                                         HDA_VERB_GET_PARAMETER,
+                                         HDA_PARAM_VENDOR_ID,
+                                         &resp)) {
             if (out_vendor)
                 *out_vendor = resp;
             g_hda.primary_codec = c;
@@ -576,10 +590,10 @@ bool hda_codec0_get_sub_nodes(uint8_t parent_nid,
     uint8_t codec = g_hda.primary_codec;
     uint32_t resp = 0;
 
-    if (!hda_send_verb_immediate(codec, parent_nid,
-                                 HDA_VERB_GET_PARAMETER,
-                                 HDA_PARAM_NODE_COUNT,
-                                 &resp)) {
+    if (!hda_send_verb_best_available(codec, parent_nid,
+                                      HDA_VERB_GET_PARAMETER,
+                                      HDA_PARAM_NODE_COUNT,
+                                      &resp)) {
         return false;
     }
 
@@ -588,6 +602,41 @@ bool hda_codec0_get_sub_nodes(uint8_t parent_nid,
 
     if (out_start) *out_start = start;
     if (out_count) *out_count = count;
+    return true;
+}
+
+bool hda_codec0_get_parameter(uint8_t nid, uint16_t parameter, uint32_t* out_resp) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    uint8_t codec = g_hda.primary_codec;
+    return hda_send_verb_best_available(codec, nid,
+                                        HDA_VERB_GET_PARAMETER,
+                                        parameter,
+                                        out_resp);
+}
+
+bool hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+
+    if (!hda_send_verb_best_available(codec, nid,
+                                      HDA_VERB_SET_POWER_STATE,
+                                      target_state,
+                                      &resp)) {
+        return false;
+    }
+
+    uint8_t current = (uint8_t)(resp & 0x0F);
+    if (out_state) {
+        *out_state = current;
+    }
+
     return true;
 }
 
