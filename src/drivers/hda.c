@@ -494,14 +494,20 @@ bool hda_init(void) {
     // 2) Enable MMIO + bus mastering for this controller
     pci_enable_mmio_and_bus_mastering(dev.bus, dev.slot, dev.func);
 
-    // 3) Read BAR0 (MMIO base)
+    // 3) Read BAR0/BAR1 (MMIO base)
     uint32_t bar0 = pci_config_read32(dev.bus, dev.slot, dev.func, 0x10);
     if (bar0 & 1) { // IO-space BAR? shouldn't happen for HDA
         g_hda.present = false;
         return false;
     }
 
-    uintptr_t phys_base = (uintptr_t)(bar0 & ~0xFu);
+    bool bar0_is_64 = ((bar0 >> 1) & 0x3) == 0x2;
+    uint32_t bar1 = 0;
+    if (bar0_is_64) {
+        bar1 = pci_config_read32(dev.bus, dev.slot, dev.func, 0x14);
+    }
+
+    uint64_t phys_base = ((uint64_t)bar1 << 32) | (uint64_t)(bar0 & ~0xFu);
     if (!phys_base) {
         g_hda.present = false;
         return false;
@@ -509,7 +515,7 @@ bool hda_init(void) {
 
     // Map MMIO BAR into the kernel's address space as uncached MMIO.
     // Intel HDA typically exposes up to 16KiB of registers; 0x4000 is safe.
-    void* mmio = hda_map_mmio_uncached((uint64_t)phys_base, 0x4000);
+    void* mmio = hda_map_mmio_uncached(phys_base, 0x4000);
     if (!mmio) {
         g_hda.present = false;
         return false;
