@@ -304,9 +304,24 @@ static bool hda_reset_controller(void) {
 static void hda_discover_codecs(void) {
     if (!g_hda.present || !g_hda.mmio_base) return;
 
-    // STATESTS bits [0..14] indicate codec presence
-    uint16_t mask = hda_mmio_read16(HDA_REG_STATESTS);
+    // STATESTS bits [0..14] indicate codec presence. On some real hardware the
+    // bits can take a little longer to assert after controller reset, so give
+    // them a modest grace period before concluding nothing is present.
+    uint64_t deadline = hda_deadline_ms(500);
+    uint16_t mask = 0;
+    while (timer_get_ticks() <= deadline) {
+        mask = hda_mmio_read16(HDA_REG_STATESTS) & 0x7FFFu;
+        if (mask != 0) break;
+        __asm__ volatile("pause");
+    }
+
     g_hda.codec_mask = mask;
+
+    // Clear any latched presence-change bits that may have accumulated during
+    // reset so subsequent hotplug/change events are visible.
+    if (mask) {
+        hda_mmio_write16(HDA_REG_STATESTS, mask);
+    }
 
     if (mask == 0) {
         g_hda.codec_present = false;
