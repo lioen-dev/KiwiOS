@@ -689,7 +689,10 @@ bool hda_init(void) {
     // 5) Discover codecs
     hda_discover_codecs();
     if (!g_hda.codec_present) {
-        return false;
+        // No codecs present is not fatal; keep the controller marked present so
+        // other subsystems can continue booting without audio capabilities.
+        g_hda.corb_rirb_ok = false;
+        return true;
     }
 
     // 6) Init CORB/RIRB
