@@ -76,4 +76,11 @@ bool     hda_codec0_power_output_path(uint8_t afg_nid,
                                       uint8_t dac_nid,
                                       uint8_t pin_nid);
 
+// Configure the powered playback path widgets (placeholder for now).
+bool     hda_codec0_configure_output_path(uint8_t dac_nid,
+                                          uint8_t pin_nid);
+
+// Bring up a simple playback stream using the discovered output path.
+bool     hda_start_output_playback(void);
+
 #endif // DRIVERS_HDA_H

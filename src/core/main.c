@@ -2027,6 +2027,17 @@ void kmain(void) {
 
                 if (hda_codec0_power_output_path(afg_nid, dac_nid, pin_nid)) {
                     print(fb0(), "HDA: powered playback path widgets to D0\n");
+                    if (hda_codec0_configure_output_path(dac_nid, pin_nid)) {
+                        print(fb0(), "HDA: configured playback path widgets\n");
+                    } else {
+                        print(fb0(), "HDA: failed to configure playback path widgets\n");
+                    }
+
+                    if (hda_start_output_playback()) {
+                        print(fb0(), "HDA: started basic output stream (square wave)\n");
+                    } else {
+                        print(fb0(), "HDA: failed to start output stream\n");
+                    }
                 } else {
                     print(fb0(), "HDA: failed to power playback path widgets\n");
                 }
