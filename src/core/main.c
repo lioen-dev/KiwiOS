@@ -2024,6 +2024,12 @@ void kmain(void) {
                 print(fb0(), ", PIN=");
                 print_u32(fb0(), pin_nid);
                 print(fb0(), ")\n");
+
+                if (hda_codec0_power_output_path(afg_nid, dac_nid, pin_nid)) {
+                    print(fb0(), "HDA: powered playback path widgets to D0\n");
+                } else {
+                    print(fb0(), "HDA: failed to power playback path widgets\n");
+                }
             } else {
                 print(fb0(), "HDA: failed to locate a DAC+output pin path on codec0\n");
             }

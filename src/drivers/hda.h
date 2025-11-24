@@ -71,4 +71,9 @@ bool     hda_codec0_find_output_path(uint8_t* out_afg_nid,
                                      uint8_t* out_dac_nid,
                                      uint8_t* out_pin_nid);
 
+// Power up the AFG/DAC/pin nodes for the discovered playback path.
+bool     hda_codec0_power_output_path(uint8_t afg_nid,
+                                      uint8_t dac_nid,
+                                      uint8_t pin_nid);
+
 #endif // DRIVERS_HDA_H

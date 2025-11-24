@@ -975,6 +975,27 @@ bool hda_codec0_find_output_path(uint8_t* out_afg_nid, uint8_t* out_dac_nid, uin
     return (dac_nid != 0) && (pin_nid != 0);
 }
 
+// Request D0 power for the AFG/DAC/pin nodes involved in playback.
+bool hda_codec0_power_output_path(uint8_t afg_nid, uint8_t dac_nid, uint8_t pin_nid) {
+    if (!afg_nid || !dac_nid || !pin_nid) return false;
+
+    uint8_t state = 0;
+
+    if (!hda_codec0_set_power_state(afg_nid, HDA_POWER_STATE_D0, &state) || state != HDA_POWER_STATE_D0) {
+        return false;
+    }
+
+    if (!hda_codec0_set_power_state(dac_nid, HDA_POWER_STATE_D0, &state) || state != HDA_POWER_STATE_D0) {
+        return false;
+    }
+
+    if (!hda_codec0_set_power_state(pin_nid, HDA_POWER_STATE_D0, &state) || state != HDA_POWER_STATE_D0) {
+        return false;
+    }
+
+    return true;
+}
+
 
 // -------------------- Simple public accessors --------------------
 
