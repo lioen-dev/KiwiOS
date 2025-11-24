@@ -131,6 +131,7 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_VERB_GET_PARAMETER  0xF00
 #define HDA_VERB_SET_CONVERTER_FORMAT 0x200
 #define HDA_VERB_SET_CONVERTER_STREAM 0x706
+#define HDA_VERB_SET_PIN_WIDGET_CONTROL 0x707
 
 // GetParameter parameter IDs
 #define HDA_PARAM_VENDOR_ID     0x00
@@ -142,6 +143,7 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
 #define HDA_VERB_GET_POWER_STATE 0xF05
+#define HDA_VERB_SET_EAPD_BTLENABLE 0x70C
 
 // Function Group Type values (from GetParameter FunctionGroupType)
 #define HDA_FG_TYPE_AUDIO 0x01
@@ -158,6 +160,9 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Pin capabilities (from GetParameter PinCapabilities, bit 4 == output)
 #define HDA_PINCAP_OUTPUT       (1u << 4)
+
+#define HDA_PIN_WIDGET_CONTROL_OUT 0x40
+#define HDA_EAPD_BTL_ENABLE        0x02
 
 // Stream descriptor offsets and bits
 #define HDA_REG_SD_BASE         0x80
@@ -1090,9 +1095,32 @@ bool hda_codec0_power_output_path(uint8_t afg_nid, uint8_t dac_nid, uint8_t pin_
 }
 
 bool hda_codec0_configure_output_path(uint8_t dac_nid, uint8_t pin_nid) {
-    // Placeholder for future pin/DAC widget configuration (amp, pin control, EAPD, etc.).
-    // Keep the signature in place so playback bring-up can hook onto the discovered path.
-    return (g_hda.present && g_hda.codec_present && dac_nid != 0 && pin_nid != 0);
+    if (!g_hda.present || !g_hda.codec_present || dac_nid == 0 || pin_nid == 0) {
+        return false;
+    }
+
+    uint32_t resp = 0;
+    uint8_t codec = g_hda.primary_codec;
+
+    // Enable output on the discovered pin widget.
+    if (!hda_send_verb_best_available(codec, pin_nid,
+                                      HDA_VERB_SET_PIN_WIDGET_CONTROL,
+                                      HDA_PIN_WIDGET_CONTROL_OUT,
+                                      &resp)) {
+        return false;
+    }
+
+    // Power up external amplifier if present.
+    if (!hda_send_verb_best_available(codec, pin_nid,
+                                      HDA_VERB_SET_EAPD_BTLENABLE,
+                                      HDA_EAPD_BTL_ENABLE,
+                                      &resp)) {
+        return false;
+    }
+
+    (void)dac_nid; // DAC-specific configuration can be added later.
+
+    return true;
 }
 
 static bool hda_codec0_set_converter_stream_channel(uint8_t dac_nid, uint8_t stream_tag, uint8_t channel) {
