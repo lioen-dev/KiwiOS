@@ -129,8 +129,14 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Common verbs/parameters
 #define HDA_VERB_GET_PARAMETER  0xF00
+#define HDA_VERB_GET_CONNECT_SEL 0xF01
+#define HDA_VERB_GET_CONNECTION_LIST_ENTRY 0xF02
 #define HDA_VERB_SET_CONVERTER_FORMAT 0x200
+#define HDA_VERB_SET_AMP_GAIN_MUTE 0x300
 #define HDA_VERB_SET_CONVERTER_STREAM 0x706
+#define HDA_VERB_SET_CONNECT_SEL 0x701
+#define HDA_VERB_SET_PIN_WIDGET_CONTROL 0x707
+#define HDA_VERB_GET_AMP_GAIN_MUTE 0xB00
 
 // GetParameter parameter IDs
 #define HDA_PARAM_VENDOR_ID     0x00
@@ -138,15 +144,19 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_PARAM_FUNCTION_TYPE 0x05
 #define HDA_PARAM_AUDIO_WIDGET_CAP 0x09
 #define HDA_PARAM_PIN_CAP       0x0C
+#define HDA_PARAM_CONN_LIST_LENGTH 0x0E
 
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
 #define HDA_VERB_GET_POWER_STATE 0xF05
+#define HDA_VERB_SET_EAPD_BTLENABLE 0x70C
 
 // Function Group Type values (from GetParameter FunctionGroupType)
 #define HDA_FG_TYPE_AUDIO 0x01
 
 // Audio Widget Capability bits
+#define HDA_AWCAP_INPUT       (1u << 0)
+#define HDA_AWCAP_OUT_AMP     (1u << 2)
 #define HDA_AWCAP_OUTPUT      (1u << 4)
 #define HDA_AWCAP_WIDGET_TYPE_SHIFT 20
 #define HDA_AWCAP_WIDGET_TYPE_MASK  0xF
@@ -158,6 +168,23 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Pin capabilities (from GetParameter PinCapabilities, bit 4 == output)
 #define HDA_PINCAP_OUTPUT       (1u << 4)
+
+#define HDA_PIN_WIDGET_CONTROL_OUT 0x40
+#define HDA_EAPD_BTL_ENABLE        0x02
+
+// Amplifier payload helpers
+#define HDA_AMP_MUTE           (1u << 7)
+#define HDA_AMP_GAIN_MASK      0x7Fu
+#define HDA_AMP_SET_INDEX_SHIFT 8
+#define HDA_AMP_SET_RIGHT      (1u << 12)
+#define HDA_AMP_SET_LEFT       (1u << 13)
+#define HDA_AMP_SET_INPUT      (1u << 14)
+#define HDA_AMP_SET_OUTPUT     (1u << 15)
+
+// Stream format helpers
+#define HDA_FMT_CHAN(ch)       ((uint16_t)(((ch) - 1) & 0x0F))
+#define HDA_FMT_BITS_16        (1u << 4)
+#define HDA_FMT_BASE_48KHZ     ((uint16_t)(6u << 11))
 
 // Stream descriptor offsets and bits
 #define HDA_REG_SD_BASE         0x80
@@ -223,6 +250,7 @@ typedef struct {
     uint8_t  afg_nid;          // first audio function group
     uint8_t  out_dac_nid;      // first audio output converter (DAC)
     uint8_t  out_pin_nid;      // first pin complex advertising output
+    uint8_t  out_pin_conn_index; // connection index on the pin routed to out_dac_nid
     bool     playback_path_cached;
 
     // Simple playback stream state
@@ -705,6 +733,89 @@ static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
     return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
 }
 
+static bool hda_codec0_get_connection_list(uint8_t nid, uint8_t* out_list, size_t max_entries, size_t* out_count) {
+    if (!g_hda.present || !g_hda.codec_present || !out_list || max_entries == 0)
+        return false;
+
+    uint32_t resp = 0;
+    if (!hda_codec0_get_parameter(nid, HDA_PARAM_CONN_LIST_LENGTH, &resp)) {
+        return false;
+    }
+
+    uint8_t length = (uint8_t)(resp & 0x7F);
+    bool long_form = (resp & 0x80) != 0;
+    if (length == 0) {
+        return false;
+    }
+
+    uint8_t codec = g_hda.primary_codec;
+    size_t count = 0;
+
+    for (uint8_t idx = 0; idx < length && count < max_entries;) {
+        uint32_t list_resp = 0;
+        if (!hda_send_verb_best_available(codec, nid,
+                                          HDA_VERB_GET_CONNECTION_LIST_ENTRY,
+                                          idx,
+                                          &list_resp)) {
+            return false;
+        }
+
+        if (long_form) {
+            uint16_t first = (uint16_t)(list_resp & 0xFFFFu);
+            uint16_t second = (uint16_t)(list_resp >> 16);
+
+            out_list[count++] = (uint8_t)first;
+            idx++;
+
+            if (idx < length && count < max_entries) {
+                out_list[count++] = (uint8_t)second;
+                idx++;
+            }
+        } else {
+            for (uint8_t shift = 0; shift < 32 && idx < length && count < max_entries; shift += 8, ++idx) {
+                uint8_t entry = (uint8_t)((list_resp >> shift) & 0xFFu);
+                out_list[count++] = entry;
+            }
+        }
+    }
+
+    if (out_count) {
+        *out_count = count;
+    }
+
+    return count > 0;
+}
+
+static bool hda_codec0_set_connect_sel(uint8_t nid, uint8_t index) {
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+
+    return hda_send_verb_best_available(codec, nid,
+                                        HDA_VERB_SET_CONNECT_SEL,
+                                        index,
+                                        &resp);
+}
+
+static bool hda_codec0_unmute_output_amp(uint8_t nid, uint8_t index, uint8_t gain) {
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+    uint16_t payload_base = HDA_AMP_SET_OUTPUT | ((uint16_t)index << HDA_AMP_SET_INDEX_SHIFT);
+
+    // Left channel
+    uint16_t payload = payload_base | HDA_AMP_SET_LEFT | (gain & HDA_AMP_GAIN_MASK);
+    if (!hda_send_verb_best_available(codec, nid, HDA_VERB_SET_AMP_GAIN_MUTE, payload, &resp)) {
+        return false;
+    }
+
+    // Right channel
+    payload = payload_base | HDA_AMP_SET_RIGHT | (gain & HDA_AMP_GAIN_MASK);
+    if (!hda_send_verb_best_available(codec, nid, HDA_VERB_SET_AMP_GAIN_MUTE, payload, &resp)) {
+        return false;
+    }
+
+    return true;
+}
+
 
 // -------------------- Public API: init --------------------
 
@@ -718,6 +829,7 @@ bool hda_init(void) {
     g_hda.afg_nid       = 0;
     g_hda.out_dac_nid   = 0;
     g_hda.out_pin_nid   = 0;
+    g_hda.out_pin_conn_index = 0;
     g_hda.playback_stream_index = 0;
     g_hda.playback_stream_tag   = 0;
     g_hda.playback_stream_ready = false;
@@ -1026,6 +1138,7 @@ bool hda_codec0_find_output_path(uint8_t* out_afg_nid, uint8_t* out_dac_nid, uin
 
     uint8_t dac_nid = 0;
     uint8_t pin_nid = 0;
+    uint8_t pin_conn_index = 0;
 
     for (uint16_t i = 0; i < widget_count; ++i) {
         uint8_t nid = (uint8_t)(widget_start + i);
@@ -1036,29 +1149,48 @@ bool hda_codec0_find_output_path(uint8_t* out_afg_nid, uint8_t* out_dac_nid, uin
 
         uint8_t widget_type = (uint8_t)((awcap >> HDA_AWCAP_WIDGET_TYPE_SHIFT) & HDA_AWCAP_WIDGET_TYPE_MASK);
 
-        if (!dac_nid && widget_type == HDA_WIDGET_TYPE_AUDIO_OUTPUT) {
-            dac_nid = nid;
-        }
-
-        if (!pin_nid && widget_type == HDA_WIDGET_TYPE_PIN_COMPLEX) {
+        if (widget_type == HDA_WIDGET_TYPE_PIN_COMPLEX && pin_nid == 0) {
             uint32_t pincap = 0;
             if (!hda_codec0_get_parameter(nid, HDA_PARAM_PIN_CAP, &pincap)) {
                 continue;
             }
 
-            if (pincap & HDA_PINCAP_OUTPUT) {
-                pin_nid = nid;
+            if ((pincap & HDA_PINCAP_OUTPUT) == 0) {
+                continue;
             }
-        }
 
-        if (dac_nid && pin_nid) {
-            break;
+            uint8_t conn_list[32];
+            size_t conn_count = 0;
+            if (!hda_codec0_get_connection_list(nid, conn_list, 32, &conn_count)) {
+                continue;
+            }
+
+            for (size_t c = 0; c < conn_count; ++c) {
+                uint8_t conn_nid = conn_list[c];
+                uint32_t conn_awcap = 0;
+                if (!hda_codec0_get_parameter(conn_nid, HDA_PARAM_AUDIO_WIDGET_CAP, &conn_awcap)) {
+                    continue;
+                }
+
+                uint8_t conn_widget_type = (uint8_t)((conn_awcap >> HDA_AWCAP_WIDGET_TYPE_SHIFT) & HDA_AWCAP_WIDGET_TYPE_MASK);
+                if (conn_widget_type == HDA_WIDGET_TYPE_AUDIO_OUTPUT) {
+                    dac_nid = conn_nid;
+                    pin_nid = nid;
+                    pin_conn_index = (uint8_t)c;
+                    break;
+                }
+            }
+
+            if (dac_nid && pin_nid) {
+                break;
+            }
         }
     }
 
     g_hda.afg_nid = afg_nid;
     g_hda.out_dac_nid = dac_nid;
     g_hda.out_pin_nid = pin_nid;
+    g_hda.out_pin_conn_index = pin_conn_index;
     g_hda.playback_path_cached = true;
 
     if (out_afg_nid) *out_afg_nid = afg_nid;
@@ -1090,9 +1222,56 @@ bool hda_codec0_power_output_path(uint8_t afg_nid, uint8_t dac_nid, uint8_t pin_
 }
 
 bool hda_codec0_configure_output_path(uint8_t dac_nid, uint8_t pin_nid) {
-    // Placeholder for future pin/DAC widget configuration (amp, pin control, EAPD, etc.).
-    // Keep the signature in place so playback bring-up can hook onto the discovered path.
-    return (g_hda.present && g_hda.codec_present && dac_nid != 0 && pin_nid != 0);
+    if (!g_hda.present || !g_hda.codec_present || dac_nid == 0 || pin_nid == 0) {
+        return false;
+    }
+
+    uint32_t resp = 0;
+    uint8_t codec = g_hda.primary_codec;
+
+    // Route the pin to the selected DAC connection index.
+    if (!hda_codec0_set_connect_sel(pin_nid, g_hda.out_pin_conn_index)) {
+        return false;
+    }
+
+    // Unmute / set gain on DAC and pin output amplifiers if present.
+    uint32_t awcap = 0;
+    if (hda_codec0_get_parameter(dac_nid, HDA_PARAM_AUDIO_WIDGET_CAP, &awcap)) {
+        if (awcap & HDA_AWCAP_OUT_AMP) {
+            if (!hda_codec0_unmute_output_amp(dac_nid, 0, 0x20)) {
+                return false;
+            }
+        }
+    }
+
+    awcap = 0;
+    if (hda_codec0_get_parameter(pin_nid, HDA_PARAM_AUDIO_WIDGET_CAP, &awcap)) {
+        if (awcap & HDA_AWCAP_OUT_AMP) {
+            if (!hda_codec0_unmute_output_amp(pin_nid, 0, 0x20)) {
+                return false;
+            }
+        }
+    }
+
+    // Enable output on the discovered pin widget.
+    if (!hda_send_verb_best_available(codec, pin_nid,
+                                      HDA_VERB_SET_PIN_WIDGET_CONTROL,
+                                      HDA_PIN_WIDGET_CONTROL_OUT,
+                                      &resp)) {
+        return false;
+    }
+
+    // Power up external amplifier if present.
+    if (!hda_send_verb_best_available(codec, pin_nid,
+                                      HDA_VERB_SET_EAPD_BTLENABLE,
+                                      HDA_EAPD_BTL_ENABLE,
+                                      &resp)) {
+        return false;
+    }
+
+    (void)dac_nid; // DAC-specific configuration can be added later.
+
+    return true;
 }
 
 static bool hda_codec0_set_converter_stream_channel(uint8_t dac_nid, uint8_t stream_tag, uint8_t channel) {
@@ -1204,8 +1383,8 @@ bool hda_start_output_playback(void) {
     hda_mmio_write32(off + HDA_SD_CBL, (uint32_t)buffer_bytes);
     hda_mmio_write16(off + HDA_SD_LVI, 0);
 
-    // 48kHz, 16-bit, 2-channel: channel count (2 - 1) | (16-bit << 4) | (48kHz << 8)
-    uint16_t fmt = (uint16_t)((1u) | (1u << 4));
+    // 48kHz, 16-bit, 2-channel format
+    uint16_t fmt = (uint16_t)(HDA_FMT_CHAN(2) | HDA_FMT_BITS_16 | HDA_FMT_BASE_48KHZ);
     hda_mmio_write16(off + HDA_SD_FMT, fmt);
 
     // Program stream tag and interrupt enables
