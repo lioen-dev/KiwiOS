@@ -130,6 +130,7 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_PARAM_NODE_COUNT    0x04
 #define HDA_PARAM_FUNCTION_TYPE 0x05
 #define HDA_PARAM_AUDIO_WIDGET_CAP 0x09
+#define HDA_PARAM_PIN_CAP       0x0C
 
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
@@ -147,6 +148,9 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_WIDGET_TYPE_AUDIO_OUTPUT 0x0
 #define HDA_WIDGET_TYPE_AUDIO_INPUT  0x1
 #define HDA_WIDGET_TYPE_PIN_COMPLEX  0x4
+
+// Pin capabilities (from GetParameter PinCapabilities, bit 4 == output)
+#define HDA_PINCAP_OUTPUT       (1u << 4)
 
 // HDA controller state
 typedef struct {
@@ -940,8 +944,15 @@ bool hda_codec0_find_output_path(uint8_t* out_afg_nid, uint8_t* out_dac_nid, uin
             dac_nid = nid;
         }
 
-        if (!pin_nid && widget_type == HDA_WIDGET_TYPE_PIN_COMPLEX && (awcap & HDA_AWCAP_OUTPUT)) {
-            pin_nid = nid;
+        if (!pin_nid && widget_type == HDA_WIDGET_TYPE_PIN_COMPLEX) {
+            uint32_t pincap = 0;
+            if (!hda_codec0_get_parameter(nid, HDA_PARAM_PIN_CAP, &pincap)) {
+                continue;
+            }
+
+            if (pincap & HDA_PINCAP_OUTPUT) {
+                pin_nid = nid;
+            }
         }
 
         if (dac_nid && pin_nid) {
