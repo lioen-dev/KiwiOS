@@ -63,4 +63,12 @@ bool     hda_codec0_get_sub_nodes(uint8_t parent_nid,
 // Request a power state change for a codec node and optionally report the resulting state (lower 4 bits of response).
 bool     hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state);
 
+// Probe for a basic playback path on the primary codec by locating the first
+// Audio Function Group, its first DAC converter, and an output-capable pin.
+// Returns true if all three were found and writes their Node IDs to the
+// provided output pointers.
+bool     hda_codec0_find_output_path(uint8_t* out_afg_nid,
+                                     uint8_t* out_dac_nid,
+                                     uint8_t* out_pin_nid);
+
 #endif // DRIVERS_HDA_H
