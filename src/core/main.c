@@ -1975,9 +1975,13 @@ void kmain(void) {
 
             uint8_t powered_state = 0xFF;
             if (hda_codec0_set_power_state(0, HDA_POWER_STATE_D0, &powered_state)) {
-                print(fb0(), "HDA: codec0 root entered power state D");
-                print_u32(fb0(), powered_state);
-                print(fb0(), "\n");
+                if (powered_state == HDA_POWER_STATE_D0) {
+                    print(fb0(), "HDA: codec0 root entered power state D0 (fully on)\n");
+                } else {
+                    print(fb0(), "HDA: codec0 root reported power state D");
+                    print_u32(fb0(), powered_state);
+                    print(fb0(), " (expected D0)\n");
+                }
             } else {
                 print(fb0(), "HDA: failed to set codec0 root power state\n");
             }
