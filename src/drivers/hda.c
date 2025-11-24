@@ -5,6 +5,7 @@
 #include "drivers/timer.h"
 #include "memory/vmm.h"   // phys_to_virt, vmm_get_kernel_page_table
 #include "memory/pmm.h"   // pmm_alloc
+#include "arch/x86/io.h"  // outb
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -102,6 +103,8 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // RIRBCTL bits
 #define HDA_RIRBCTL_DMA_EN   (1u << 0)
+#define HDA_RIRBCTL_IRQ_EN   (1u << 1)
+#define HDA_RIRBCTL_OVF_EN   (1u << 2)
 
 // CORBRP bits
 #define HDA_CORBRP_RST       (1u << 15)
@@ -114,6 +117,10 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_CORB_RIRB_16_ENTRIES  0x1
 #define HDA_CORB_RIRB_256_ENTRIES 0x2
 
+// RIRBSTS bits
+#define HDA_RIRBSTS_IRQ      (1u << 0)
+#define HDA_RIRBSTS_OVF      (1u << 2)
+
 // Common verbs/parameters
 #define HDA_VERB_GET_PARAMETER  0xF00
 
@@ -123,8 +130,7 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
-#define HDA_POWER_STATE_D0 0x00
-#define HDA_POWER_STATE_D3 0x03
+#define HDA_VERB_GET_POWER_STATE 0xF05
 
 // HDA controller state
 typedef struct {
@@ -153,6 +159,15 @@ typedef struct {
 
     uint8_t  corb_wp;          // last written index
     uint16_t rirb_rp;          // last seen read pointer
+
+    // Interrupt / response handling
+    uint8_t  irq_line;         // PCI legacy IRQ line (0xFF if none)
+    bool     irq_enabled;      // PIC/IDT wired up
+    bool     rirb_irq_armed;   // RIRB interrupt enable programmed
+
+    uint64_t resp_queue[32];   // buffered RIRB responses (low 32 bits used)
+    uint8_t  resp_head;        // dequeue index
+    uint8_t  resp_tail;        // enqueue index
 } hda_controller_t;
 
 static hda_controller_t g_hda = {0};
@@ -199,6 +214,47 @@ static inline void hda_mmio_write16(size_t offset, uint16_t value) {
 
 static inline void hda_mmio_write32(size_t offset, uint32_t value) {
     *(volatile uint32_t *)(g_hda.mmio_base + offset) = value;
+}
+
+// -------------------- Response queue helpers --------------------
+
+static inline void hda_resp_queue_reset(void) {
+    g_hda.resp_head = 0;
+    g_hda.resp_tail = 0;
+}
+
+static inline void hda_resp_queue_push(uint64_t entry) {
+    uint8_t next_tail = (uint8_t)((g_hda.resp_tail + 1) & 0x1F);
+    if (next_tail == g_hda.resp_head) {
+        // Drop oldest entry on overflow
+        g_hda.resp_head = (uint8_t)((g_hda.resp_head + 1) & 0x1F);
+    }
+
+    g_hda.resp_queue[g_hda.resp_tail] = entry;
+    g_hda.resp_tail = next_tail;
+}
+
+static inline bool hda_resp_queue_pop(uint32_t* out_resp) {
+    if (g_hda.resp_head == g_hda.resp_tail)
+        return false;
+
+    uint64_t entry = g_hda.resp_queue[g_hda.resp_head];
+    g_hda.resp_head = (uint8_t)((g_hda.resp_head + 1) & 0x1F);
+
+    if (out_resp)
+        *out_resp = (uint32_t)(entry & 0xFFFFFFFFu);
+    return true;
+}
+
+static bool hda_wait_for_rirb_irq(uint8_t start_tail, uint32_t* out_resp, uint32_t timeout_ms) {
+    uint64_t deadline = hda_deadline_ms(timeout_ms);
+    while (g_hda.resp_tail == start_tail) {
+        if (timer_get_ticks() > deadline)
+            return false;
+        __asm__ volatile("pause");
+    }
+
+    return hda_resp_queue_pop(out_resp);
 }
 
 
@@ -305,9 +361,24 @@ static bool hda_reset_controller(void) {
 static void hda_discover_codecs(void) {
     if (!g_hda.present || !g_hda.mmio_base) return;
 
-    // STATESTS bits [0..14] indicate codec presence
-    uint16_t mask = hda_mmio_read16(HDA_REG_STATESTS);
+    // STATESTS bits [0..14] indicate codec presence. On some real hardware the
+    // bits can take a little longer to assert after controller reset, so give
+    // them a modest grace period before concluding nothing is present.
+    uint64_t deadline = hda_deadline_ms(500);
+    uint16_t mask = 0;
+    while (timer_get_ticks() <= deadline) {
+        mask = hda_mmio_read16(HDA_REG_STATESTS) & 0x7FFFu;
+        if (mask != 0) break;
+        __asm__ volatile("pause");
+    }
+
     g_hda.codec_mask = mask;
+
+    // Clear any latched presence-change bits that may have accumulated during
+    // reset so subsequent hotplug/change events are visible.
+    if (mask) {
+        hda_mmio_write16(HDA_REG_STATESTS, mask);
+    }
 
     if (mask == 0) {
         g_hda.codec_present = false;
@@ -363,6 +434,7 @@ static bool hda_init_corb_rirb(void) {
     g_hda.rirb_entries = 16;
     g_hda.corb_wp      = 0;
     g_hda.rirb_rp      = 0;
+    hda_resp_queue_reset();
 
     // 3) Program CORB/RIRB base registers
     hda_mmio_write32(HDA_REG_CORBLBASE, (uint32_t)(corb_phys & 0xFFFFFFFFu));
@@ -412,13 +484,28 @@ static bool hda_send_verb_corb(uint8_t codec, uint8_t node,
     uint8_t new_wp = (uint8_t)((g_hda.corb_wp + 1) & (corb_entries - 1));
     uint32_t cmd   = hda_make_verb(codec, node, verb, payload);
 
+    // Ensure we start from a clean queue snapshot when using interrupts.
+    if (g_hda.rirb_irq_armed) {
+        hda_resp_queue_reset();
+        g_hda.rirb_rp = hda_mmio_read16(HDA_REG_RIRBWP) & 0xFFu;
+    }
+
     g_hda.corb_virt[new_wp] = cmd;
     g_hda.corb_wp = new_wp;
 
     // 2) Notify hardware of new write pointer
     hda_mmio_write8(HDA_REG_CORBWP, new_wp);
 
-    // 3) Poll RIRBWP until it advances
+    // 3) Prefer interrupt-backed completion if available
+    if (g_hda.rirb_irq_armed) {
+        uint8_t start_tail = g_hda.resp_tail;
+        if (hda_wait_for_rirb_irq(start_tail, out_resp, 100)) {
+            return true;
+        }
+        // Fall back to polling if the interrupt never arrived
+    }
+
+    // 4) Poll RIRBWP until it advances
     uint16_t old_rp = g_hda.rirb_rp;
 
     uint64_t deadline_rirb = hda_deadline_ms(100);
@@ -452,11 +539,29 @@ static bool hda_send_verb_corb(uint8_t codec, uint8_t node,
     return false; // timeout waiting for RIRB response
 }
 
+// Try CORB first (if configured) and fall back to Immediate Command on failure.
+static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
+                                         uint16_t verb, uint16_t payload,
+                                         uint32_t* out_resp) {
+    if (g_hda.corb_rirb_ok) {
+        if (hda_send_verb_corb(codec, node, verb, payload, out_resp)) {
+            return true;
+        }
+    }
+
+    return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
+}
+
 
 // -------------------- Public API: init --------------------
 
 bool hda_init(void) {
     pci_device_t dev;
+
+    g_hda.irq_line       = 0xFF;
+    g_hda.irq_enabled    = false;
+    g_hda.rirb_irq_armed = false;
+    hda_resp_queue_reset();
 
     // 1) PCI detect
     if (!pci_find_class_subclass(HDA_PCI_CLASS, HDA_PCI_SUBCLASS, &dev)) {
@@ -464,17 +569,25 @@ bool hda_init(void) {
         return false;
     }
 
+    g_hda.irq_line = pci_config_read8(dev.bus, dev.slot, dev.func, 0x3C);
+
     // 2) Enable MMIO + bus mastering for this controller
     pci_enable_mmio_and_bus_mastering(dev.bus, dev.slot, dev.func);
 
-    // 3) Read BAR0 (MMIO base)
+    // 3) Read BAR0/BAR1 (MMIO base)
     uint32_t bar0 = pci_config_read32(dev.bus, dev.slot, dev.func, 0x10);
     if (bar0 & 1) { // IO-space BAR? shouldn't happen for HDA
         g_hda.present = false;
         return false;
     }
 
-    uintptr_t phys_base = (uintptr_t)(bar0 & ~0xFu);
+    bool bar0_is_64 = ((bar0 >> 1) & 0x3) == 0x2;
+    uint32_t bar1 = 0;
+    if (bar0_is_64) {
+        bar1 = pci_config_read32(dev.bus, dev.slot, dev.func, 0x14);
+    }
+
+    uint64_t phys_base = ((uint64_t)bar1 << 32) | (uint64_t)(bar0 & ~0xFu);
     if (!phys_base) {
         g_hda.present = false;
         return false;
@@ -482,7 +595,7 @@ bool hda_init(void) {
 
     // Map MMIO BAR into the kernel's address space as uncached MMIO.
     // Intel HDA typically exposes up to 16KiB of registers; 0x4000 is safe.
-    void* mmio = hda_map_mmio_uncached((uint64_t)phys_base, 0x4000);
+    void* mmio = hda_map_mmio_uncached(phys_base, 0x4000);
     if (!mmio) {
         g_hda.present = false;
         return false;
@@ -517,6 +630,24 @@ bool hda_init(void) {
     return true;
 }
 
+bool hda_enable_interrupts(void) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.corb_rirb_ok) return false;
+
+    uint8_t rirbctl = hda_mmio_read8(HDA_REG_RIRBCTL);
+    rirbctl |= HDA_RIRBCTL_DMA_EN | HDA_RIRBCTL_IRQ_EN | HDA_RIRBCTL_OVF_EN;
+    hda_mmio_write8(HDA_REG_RIRBCTL, rirbctl);
+
+    uint8_t sts = hda_mmio_read8(HDA_REG_RIRBSTS);
+    if (sts) {
+        hda_mmio_write8(HDA_REG_RIRBSTS, sts);
+    }
+
+    g_hda.rirb_irq_armed = true;
+    g_hda.irq_enabled    = true;
+    return true;
+}
+
 
 // -------------------- Helpers: codec0 info --------------------
 
@@ -528,33 +659,14 @@ bool hda_get_codec0_vendor_immediate(uint32_t* out_vendor) {
     uint16_t mask = g_hda.codec_mask;
     uint32_t resp = 0;
 
-    // 1) First pass: use CORB/RIRB for any codec that has a bit set.
-    if (g_hda.corb_rirb_ok) {
-        for (uint8_t c = 0; c < 15; c++) {
-            if (!(mask & (1u << c)))
-                continue;
-
-            if (hda_send_verb_corb(c, 0,
-                                   HDA_VERB_GET_PARAMETER,
-                                   HDA_PARAM_VENDOR_ID,
-                                   &resp)) {
-                if (out_vendor)
-                    *out_vendor = resp;
-                g_hda.primary_codec = c;
-                return true;
-            }
-        }
-    }
-
-    // 2) Second pass: fall back to Immediate Command for each codec.
     for (uint8_t c = 0; c < 15; c++) {
         if (!(mask & (1u << c)))
             continue;
 
-        if (hda_send_verb_immediate(c, 0,
-                                    HDA_VERB_GET_PARAMETER,
-                                    HDA_PARAM_VENDOR_ID,
-                                    &resp)) {
+        if (hda_send_verb_best_available(c, 0,
+                                         HDA_VERB_GET_PARAMETER,
+                                         HDA_PARAM_VENDOR_ID,
+                                         &resp)) {
             if (out_vendor)
                 *out_vendor = resp;
             g_hda.primary_codec = c;
@@ -576,10 +688,10 @@ bool hda_codec0_get_sub_nodes(uint8_t parent_nid,
     uint8_t codec = g_hda.primary_codec;
     uint32_t resp = 0;
 
-    if (!hda_send_verb_immediate(codec, parent_nid,
-                                 HDA_VERB_GET_PARAMETER,
-                                 HDA_PARAM_NODE_COUNT,
-                                 &resp)) {
+    if (!hda_send_verb_best_available(codec, parent_nid,
+                                      HDA_VERB_GET_PARAMETER,
+                                      HDA_PARAM_NODE_COUNT,
+                                      &resp)) {
         return false;
     }
 
@@ -589,6 +701,103 @@ bool hda_codec0_get_sub_nodes(uint8_t parent_nid,
     if (out_start) *out_start = start;
     if (out_count) *out_count = count;
     return true;
+}
+
+bool hda_codec0_get_parameter(uint8_t nid, uint16_t parameter, uint32_t* out_resp) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    uint8_t codec = g_hda.primary_codec;
+    return hda_send_verb_best_available(codec, nid,
+                                        HDA_VERB_GET_PARAMETER,
+                                        parameter,
+                                        out_resp);
+}
+
+void hda_irq_handler(uint64_t* interrupt_rsp) {
+    (void)interrupt_rsp;
+
+    if (!g_hda.present || !g_hda.mmio_base) goto ack;
+    if (!g_hda.corb_rirb_ok) goto ack;
+
+    uint8_t sts = hda_mmio_read8(HDA_REG_RIRBSTS);
+    if ((sts & (HDA_RIRBSTS_IRQ | HDA_RIRBSTS_OVF)) == 0) {
+        goto ack;
+    }
+
+    uint16_t hw_wp = hda_mmio_read16(HDA_REG_RIRBWP) & 0xFFu;
+    uint16_t rp    = g_hda.rirb_rp;
+
+    if (g_hda.rirb_entries == 0 || !g_hda.rirb_virt) {
+        goto clear_only;
+    }
+
+    while (rp != hw_wp) {
+        rp = (uint16_t)((rp + 1) & 0xFFu);
+        uint16_t idx = (uint16_t)(rp & (g_hda.rirb_entries - 1));
+        uint64_t entry = g_hda.rirb_virt[idx];
+        hda_resp_queue_push(entry);
+    }
+
+    g_hda.rirb_rp = hw_wp;
+
+clear_only:
+    if (sts) {
+        hda_mmio_write8(HDA_REG_RIRBSTS, sts);
+    }
+
+ack:
+    if (g_hda.irq_line >= 8) {
+        outb(0xA0, 0x20);
+    }
+    outb(0x20, 0x20);
+}
+
+bool hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+
+    if (!hda_send_verb_best_available(codec, nid,
+                                      HDA_VERB_SET_POWER_STATE,
+                                      target_state,
+                                      &resp)) {
+        return false;
+    }
+
+    uint8_t current = (uint8_t)(resp & 0x0F);
+    uint64_t deadline = hda_deadline_ms(200);
+
+    while (current != target_state) {
+        if (timer_get_ticks() > deadline) {
+            break;
+        }
+
+        uint32_t get_resp = 0;
+        if (!hda_send_verb_best_available(codec, nid,
+                                          HDA_VERB_GET_POWER_STATE,
+                                          0,
+                                          &get_resp)) {
+            break;
+        }
+
+        current = (uint8_t)(get_resp & 0x0F);
+        if (current == target_state) {
+            break;
+        }
+
+        __asm__ volatile("pause");
+    }
+
+    if (out_state) {
+        *out_state = current;
+    }
+
+    return current == target_state;
 }
 
 
@@ -624,4 +833,7 @@ uint16_t hda_get_codec_mask(void) {
 }
 bool hda_corb_rirb_ready(void) {
     return g_hda.corb_rirb_ok;
+}
+uint8_t hda_get_irq_line(void) {
+    return g_hda.irq_line;
 }
