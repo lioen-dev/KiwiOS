@@ -86,6 +86,11 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_REG_RIRBSTS   0x5D // RIRB Status (8-bit)
 #define HDA_REG_RIRBSIZE  0x5E // RIRB Size (8-bit)
 
+// Interrupt control/status
+#define HDA_REG_INTCTL    0x20 // Interrupt Control (32-bit)
+#define HDA_REG_INTSTS    0x24 // Interrupt Status (32-bit)
+#define HDA_INTCTL_GIE    (1u << 31)
+
 // Immediate Command registers
 #define HDA_REG_IC       0x60  // Immediate Command Output (32-bit)
 #define HDA_REG_IR       0x64  // Immediate Response Input (32-bit)
@@ -124,6 +129,8 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Common verbs/parameters
 #define HDA_VERB_GET_PARAMETER  0xF00
+#define HDA_VERB_SET_CONVERTER_FORMAT 0x200
+#define HDA_VERB_SET_CONVERTER_STREAM 0x706
 
 // GetParameter parameter IDs
 #define HDA_PARAM_VENDOR_ID     0x00
@@ -151,6 +158,29 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // Pin capabilities (from GetParameter PinCapabilities, bit 4 == output)
 #define HDA_PINCAP_OUTPUT       (1u << 4)
+
+// Stream descriptor offsets and bits
+#define HDA_REG_SD_BASE         0x80
+#define HDA_REG_SD_INTERVAL     0x20
+
+#define HDA_SD_CTL              0x00
+#define HDA_SD_STS              0x03
+#define HDA_SD_LPIB             0x04
+#define HDA_SD_CBL              0x08
+#define HDA_SD_LVI              0x0C
+#define HDA_SD_FMT              0x12
+#define HDA_SD_BDPL             0x18
+#define HDA_SD_BDPU             0x1C
+
+#define HDA_SDCTL_SRST          (1u << 0)
+#define HDA_SDCTL_RUN           (1u << 1)
+#define HDA_SDCTL_IOCE          (1u << 2)
+#define HDA_SDCTL_FEIE          (1u << 3)
+#define HDA_SDCTL_DEIE          (1u << 4)
+#define HDA_SDCTL_STRIPE_MASK   (3u << 16)
+#define HDA_SDCTL_TRAFFIC_PRIO  (1u << 18)
+#define HDA_SDCTL_STREAM_TAG_SHIFT 20
+#define HDA_SDCTL_STREAM_TAG_MASK  (0xFu << HDA_SDCTL_STREAM_TAG_SHIFT)
 
 // HDA controller state
 typedef struct {
@@ -194,6 +224,14 @@ typedef struct {
     uint8_t  out_dac_nid;      // first audio output converter (DAC)
     uint8_t  out_pin_nid;      // first pin complex advertising output
     bool     playback_path_cached;
+
+    // Simple playback stream state
+    uint8_t  playback_stream_index; // zero-based stream descriptor index
+    uint8_t  playback_stream_tag;   // hardware stream tag programmed into SDnCTL
+    bool     playback_stream_ready;
+    uint64_t playback_bdl_phys;
+    uint64_t playback_buffer_phys;
+    size_t   playback_buffer_bytes;
 } hda_controller_t;
 
 static hda_controller_t g_hda = {0};
@@ -240,6 +278,55 @@ static inline void hda_mmio_write16(size_t offset, uint16_t value) {
 
 static inline void hda_mmio_write32(size_t offset, uint32_t value) {
     *(volatile uint32_t *)(g_hda.mmio_base + offset) = value;
+}
+
+// -------------------- Stream helpers --------------------
+
+typedef struct {
+    uint64_t address;
+    uint32_t length;
+    uint32_t flags;
+} __attribute__((packed)) hda_bdl_entry_t;
+
+static inline uint8_t hda_output_stream_count(void) {
+    return (uint8_t)((g_hda.gcap & 0x0Fu) + 1);
+}
+
+static inline size_t hda_stream_offset(uint8_t index) {
+    return HDA_REG_SD_BASE + (size_t)index * HDA_REG_SD_INTERVAL;
+}
+
+static bool hda_reset_stream(uint8_t index) {
+    size_t off = hda_stream_offset(index);
+    uint32_t ctl = hda_mmio_read32(off + HDA_SD_CTL);
+
+    // Assert stream reset
+    ctl |= HDA_SDCTL_SRST;
+    hda_mmio_write32(off + HDA_SD_CTL, ctl);
+
+    uint64_t deadline = hda_deadline_ms(100);
+    while ((hda_mmio_read32(off + HDA_SD_CTL) & HDA_SDCTL_SRST) == 0) {
+        if (timer_get_ticks() > deadline) {
+            return false;
+        }
+        __asm__ volatile("pause");
+    }
+
+    // De-assert stream reset
+    ctl &= ~HDA_SDCTL_SRST;
+    hda_mmio_write32(off + HDA_SD_CTL, ctl);
+
+    deadline = hda_deadline_ms(100);
+    while (hda_mmio_read32(off + HDA_SD_CTL) & HDA_SDCTL_SRST) {
+        if (timer_get_ticks() > deadline) {
+            return false;
+        }
+        __asm__ volatile("pause");
+    }
+
+    // Clear any sticky status bits
+    hda_mmio_write8(off + HDA_SD_STS, 0xFF);
+    return true;
 }
 
 // -------------------- Response queue helpers --------------------
@@ -631,6 +718,12 @@ bool hda_init(void) {
     g_hda.afg_nid       = 0;
     g_hda.out_dac_nid   = 0;
     g_hda.out_pin_nid   = 0;
+    g_hda.playback_stream_index = 0;
+    g_hda.playback_stream_tag   = 0;
+    g_hda.playback_stream_ready = false;
+    g_hda.playback_bdl_phys     = 0;
+    g_hda.playback_buffer_phys  = 0;
+    g_hda.playback_buffer_bytes = 0;
     hda_resp_queue_reset();
 
     // 1) PCI detect
@@ -992,6 +1085,160 @@ bool hda_codec0_power_output_path(uint8_t afg_nid, uint8_t dac_nid, uint8_t pin_
     if (!hda_codec0_set_power_state(pin_nid, HDA_POWER_STATE_D0, &state) || state != HDA_POWER_STATE_D0) {
         return false;
     }
+
+    return true;
+}
+
+bool hda_codec0_configure_output_path(uint8_t dac_nid, uint8_t pin_nid) {
+    // Placeholder for future pin/DAC widget configuration (amp, pin control, EAPD, etc.).
+    // Keep the signature in place so playback bring-up can hook onto the discovered path.
+    return (g_hda.present && g_hda.codec_present && dac_nid != 0 && pin_nid != 0);
+}
+
+static bool hda_codec0_set_converter_stream_channel(uint8_t dac_nid, uint8_t stream_tag, uint8_t channel) {
+    if (!dac_nid || stream_tag == 0) {
+        return false;
+    }
+
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+    uint16_t payload = (uint16_t)(((stream_tag & 0x0F) << 4) | (channel & 0x0F));
+
+    return hda_send_verb_best_available(codec, dac_nid,
+                                        HDA_VERB_SET_CONVERTER_STREAM,
+                                        payload,
+                                        &resp);
+}
+
+static bool hda_codec0_set_converter_format(uint8_t dac_nid, uint16_t fmt) {
+    if (!dac_nid) {
+        return false;
+    }
+
+    uint8_t codec = g_hda.primary_codec;
+    uint32_t resp = 0;
+
+    return hda_send_verb_best_available(codec, dac_nid,
+                                        HDA_VERB_SET_CONVERTER_FORMAT,
+                                        fmt,
+                                        &resp);
+}
+
+static void hda_fill_square_wave_16le(uint8_t* buffer, size_t bytes) {
+    if (!buffer || bytes < 4) return;
+
+    int16_t* samples = (int16_t*)buffer;
+    size_t sample_count = bytes / sizeof(int16_t);
+    int16_t high = 12000;
+    int16_t low  = -12000;
+    size_t period_samples = 48; // ~1 kHz at 48 kHz
+
+    for (size_t i = 0; i + 1 < sample_count; i += 2) {
+        size_t phase = (i / 2) % period_samples;
+        int16_t value = (phase < (period_samples / 2)) ? high : low;
+        samples[i]     = value;
+        samples[i + 1] = value;
+    }
+}
+
+bool hda_start_output_playback(void) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.out_dac_nid || !g_hda.out_pin_nid) return false;
+
+    uint8_t out_streams = hda_output_stream_count();
+    if (out_streams == 0) {
+        return false;
+    }
+
+    uint8_t stream_index = 0xFF;
+    for (uint8_t i = 0; i < out_streams; ++i) {
+        size_t off = hda_stream_offset(i);
+        uint32_t ctl = hda_mmio_read32(off + HDA_SD_CTL);
+        if ((ctl & HDA_SDCTL_RUN) == 0) {
+            stream_index = i;
+            break;
+        }
+    }
+
+    if (stream_index == 0xFF) {
+        return false; // no free output stream
+    }
+
+    if (!hda_reset_stream(stream_index)) {
+        return false;
+    }
+
+    void* bdl_page = pmm_alloc();
+    if (!bdl_page) {
+        return false;
+    }
+    uint64_t bdl_phys = (uint64_t)(uintptr_t)bdl_page;
+    hda_bdl_entry_t* bdl = (hda_bdl_entry_t*)phys_to_virt(bdl_phys);
+    memset(bdl, 0, PAGE_SIZE);
+
+    void* buffer_page = pmm_alloc();
+    if (!buffer_page) {
+        pmm_free(bdl_page);
+        return false;
+    }
+
+    uint64_t buffer_phys = (uint64_t)(uintptr_t)buffer_page;
+    uint8_t* buffer_virt = (uint8_t*)phys_to_virt(buffer_phys);
+    size_t buffer_bytes = PAGE_SIZE;
+
+    memset(buffer_virt, 0, buffer_bytes);
+    hda_fill_square_wave_16le(buffer_virt, buffer_bytes);
+
+    bdl[0].address = buffer_phys;
+    bdl[0].length  = (uint32_t)buffer_bytes;
+    bdl[0].flags   = 1; // Interrupt on completion
+
+    size_t off = hda_stream_offset(stream_index);
+
+    // Program buffer descriptor list
+    hda_mmio_write32(off + HDA_SD_BDPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));
+    hda_mmio_write32(off + HDA_SD_BDPU, (uint32_t)(bdl_phys >> 32));
+
+    // Program cyclic buffer length and last valid index (single entry)
+    hda_mmio_write32(off + HDA_SD_CBL, (uint32_t)buffer_bytes);
+    hda_mmio_write16(off + HDA_SD_LVI, 0);
+
+    // 48kHz, 16-bit, 2-channel: channel count (2 - 1) | (16-bit << 4) | (48kHz << 8)
+    uint16_t fmt = (uint16_t)((1u) | (1u << 4));
+    hda_mmio_write16(off + HDA_SD_FMT, fmt);
+
+    // Program stream tag and interrupt enables
+    uint8_t stream_tag = (uint8_t)(stream_index + 1);
+    uint32_t ctl = hda_mmio_read32(off + HDA_SD_CTL);
+    ctl &= ~(HDA_SDCTL_STREAM_TAG_MASK | HDA_SDCTL_STRIPE_MASK | HDA_SDCTL_TRAFFIC_PRIO);
+    ctl |= ((uint32_t)stream_tag << HDA_SDCTL_STREAM_TAG_SHIFT);
+    ctl |= HDA_SDCTL_IOCE | HDA_SDCTL_FEIE | HDA_SDCTL_DEIE;
+    hda_mmio_write32(off + HDA_SD_CTL, ctl);
+
+    if (!hda_codec0_set_converter_format(g_hda.out_dac_nid, fmt)) {
+        return false;
+    }
+
+    if (!hda_codec0_set_converter_stream_channel(g_hda.out_dac_nid, stream_tag, 0)) {
+        return false;
+    }
+
+    // Enable interrupt for this stream and globally
+    uint32_t intctl = hda_mmio_read32(HDA_REG_INTCTL);
+    intctl |= (1u << stream_index) | HDA_INTCTL_GIE;
+    hda_mmio_write32(HDA_REG_INTCTL, intctl);
+
+    // Kick RUN bit
+    ctl |= HDA_SDCTL_RUN;
+    hda_mmio_write32(off + HDA_SD_CTL, ctl);
+
+    g_hda.playback_stream_index = stream_index;
+    g_hda.playback_stream_tag   = stream_tag;
+    g_hda.playback_buffer_phys  = buffer_phys;
+    g_hda.playback_bdl_phys     = bdl_phys;
+    g_hda.playback_buffer_bytes = buffer_bytes;
+    g_hda.playback_stream_ready = true;
 
     return true;
 }
