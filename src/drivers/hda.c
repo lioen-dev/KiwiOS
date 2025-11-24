@@ -646,6 +646,19 @@ static bool hda_send_verb_corb(uint8_t codec, uint8_t node,
     return false; // timeout waiting for RIRB response
 }
 
+// Try CORB first (if configured) and fall back to Immediate Command on failure.
+static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
+                                         uint16_t verb, uint16_t payload,
+                                         uint32_t* out_resp) {
+    if (g_hda.corb_rirb_ok) {
+        if (hda_send_verb_corb(codec, node, verb, payload, out_resp)) {
+            return true;
+        }
+    }
+
+    return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
+}
+
 
 // -------------------- Basic output stream setup --------------------
 
