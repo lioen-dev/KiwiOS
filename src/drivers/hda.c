@@ -67,40 +67,6 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_REG_OUTSTRMPAY 0x18 // Output Stream Payload Capability (16-bit)
 #define HDA_REG_INSTRMPAY  0x1A // Input Stream Payload Capability (16-bit)
 
-// Stream descriptor region starts at 0x80; each descriptor is 0x20 bytes.
-#define HDA_STREAM_BASE          0x80
-#define HDA_STREAM_STRIDE        0x20
-
-// Stream descriptor register offsets (relative to base + stride*n)
-#define HDA_SD_REG_CTL     0x00  // Control (24-bit significant)
-#define HDA_SD_REG_STS     0x03  // Status (8-bit)
-#define HDA_SD_REG_LPIB    0x04  // Link Position in Buffer (32-bit)
-#define HDA_SD_REG_CBL     0x08  // Cyclic Buffer Length (32-bit)
-#define HDA_SD_REG_LVI     0x0C  // Last Valid Index (16-bit)
-#define HDA_SD_REG_FMT     0x12  // Format (16-bit)
-#define HDA_SD_REG_BDLPL   0x18  // BDL Physical Address (lower 32 bits)
-#define HDA_SD_REG_BDLPU   0x1C  // BDL Physical Address (upper 32 bits)
-
-// Stream descriptor control bits
-#define HDA_SD_CTL_SRST    (1u << 0)   // stream reset
-#define HDA_SD_CTL_RUN     (1u << 1)   // stream run
-#define HDA_SD_CTL_IOCE    (1u << 2)   // interrupt on completion enable
-#define HDA_SD_CTL_FEIE    (1u << 3)   // FIFO error interrupt enable
-#define HDA_SD_CTL_DEIE    (1u << 4)   // descriptor error interrupt enable
-#define HDA_SD_CTL_STRM_SHIFT 20       // stream number/tag field shift
-#define HDA_SD_CTL_STRM_MASK  (0xF << HDA_SD_CTL_STRM_SHIFT)
-
-// Stream descriptor status bits
-#define HDA_SD_STS_BCIS    (1u << 0)   // buffer completion interrupt status
-#define HDA_SD_STS_FIFORDY (1u << 1)   // FIFO ready
-#define HDA_SD_STS_FE      (1u << 2)   // FIFO error
-#define HDA_SD_STS_DE      (1u << 3)   // descriptor error
-
-// GCAP stream count helpers
-#define HDA_GCAP_BSS(gcap) (((gcap) >> 4)  & 0xF)
-#define HDA_GCAP_ISS(gcap) (((gcap) >> 8)  & 0xF)
-#define HDA_GCAP_OSS(gcap) (((gcap) >> 12) & 0xF)
-
 // CORB (Command Output Ring Buffer) registers
 #define HDA_REG_CORBLBASE 0x40  // CORB Lower Base Address (32-bit)
 #define HDA_REG_CORBUBASE 0x44  // CORB Upper Base Address (32-bit)
@@ -166,13 +132,6 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_VERB_SET_POWER_STATE 0x705
 #define HDA_VERB_GET_POWER_STATE 0xF05
 
-// Buffer Descriptor List entry (16 bytes)
-typedef struct __attribute__((packed)) {
-    uint64_t address;  // physical address of buffer fragment
-    uint32_t length;   // length of fragment
-    uint32_t flags;    // bit 0 = IOC (interrupt on completion)
-} hda_bdl_entry_t;
-
 // HDA controller state
 typedef struct {
     bool     present;
@@ -209,19 +168,6 @@ typedef struct {
     uint64_t resp_queue[32];   // buffered RIRB responses (low 32 bits used)
     uint8_t  resp_head;        // dequeue index
     uint8_t  resp_tail;        // enqueue index
-
-    // Simple output stream setup
-    uint8_t  output_stream_index;   // absolute SD index for the first output stream
-    uint8_t  output_stream_tag;     // stream tag programmed into SDnCTL (non-zero)
-    uint16_t output_stream_format;  // cached SDnFMT value
-    uint32_t output_buffer_bytes;   // size of the backing buffer (CBL)
-    uint16_t output_bdl_entries;    // number of BDL entries (LVI + 1)
-    uint64_t output_bdl_phys;       // physical address of BDL page
-    uint64_t output_buf_phys;       // physical address of PCM buffer
-    void*    output_bdl_virt;       // virtual address of BDL
-    void*    output_buf_virt;       // virtual address of PCM buffer
-    bool     output_stream_ready;   // BDL/buffer programmed into SD registers
-    bool     output_stream_running; // SD RUN bit asserted
 } hda_controller_t;
 
 static hda_controller_t g_hda = {0};
@@ -270,11 +216,6 @@ static inline void hda_mmio_write32(size_t offset, uint32_t value) {
     *(volatile uint32_t *)(g_hda.mmio_base + offset) = value;
 }
 
-// Stream descriptor helpers
-static inline size_t hda_stream_offset(uint8_t sd_index) {
-    return HDA_STREAM_BASE + (size_t)sd_index * HDA_STREAM_STRIDE;
-}
-
 // -------------------- Response queue helpers --------------------
 
 static inline void hda_resp_queue_reset(void) {
@@ -314,54 +255,6 @@ static bool hda_wait_for_rirb_irq(uint8_t start_tail, uint32_t* out_resp, uint32
     }
 
     return hda_resp_queue_pop(out_resp);
-}
-
-
-// -------------------- Stream helpers --------------------
-
-static bool hda_reset_stream(uint8_t sd_index) {
-    size_t base = hda_stream_offset(sd_index);
-
-    // Assert SRST
-    uint8_t ctl = hda_mmio_read8(base + HDA_SD_REG_CTL);
-    ctl |= HDA_SD_CTL_SRST;
-    hda_mmio_write8(base + HDA_SD_REG_CTL, ctl);
-
-    uint64_t deadline_set = hda_deadline_ms(50);
-    while (!(hda_mmio_read8(base + HDA_SD_REG_CTL) & HDA_SD_CTL_SRST)) {
-        if (timer_get_ticks() > deadline_set) {
-            return false;
-        }
-        __asm__ volatile("pause");
-    }
-
-    // De-assert SRST
-    ctl = hda_mmio_read8(base + HDA_SD_REG_CTL);
-    ctl &= (uint8_t)~HDA_SD_CTL_SRST;
-    hda_mmio_write8(base + HDA_SD_REG_CTL, ctl);
-
-    uint64_t deadline_clear = hda_deadline_ms(50);
-    while (hda_mmio_read8(base + HDA_SD_REG_CTL) & HDA_SD_CTL_SRST) {
-        if (timer_get_ticks() > deadline_clear) {
-            return false;
-        }
-        __asm__ volatile("pause");
-    }
-
-    // Clear latched status
-    uint8_t sts = hda_mmio_read8(base + HDA_SD_REG_STS);
-    if (sts) {
-        hda_mmio_write8(base + HDA_SD_REG_STS, sts);
-    }
-
-    return true;
-}
-
-static void hda_stop_stream(uint8_t sd_index) {
-    size_t base = hda_stream_offset(sd_index);
-    uint32_t ctl = hda_mmio_read32(base + HDA_SD_REG_CTL);
-    ctl &= ~HDA_SD_CTL_RUN;
-    hda_mmio_write32(base + HDA_SD_REG_CTL, ctl);
 }
 
 
@@ -660,310 +553,6 @@ static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
 }
 
 
-// -------------------- Basic output stream setup --------------------
-
-static uint8_t hda_pick_first_output_stream(void) {
-    uint8_t oss = HDA_GCAP_OSS(g_hda.gcap);
-    if (oss == 0) {
-        return 0xFF;
-    }
-    // Output streams come first in the SD block
-    return 0;
-}
-
-static void hda_program_output_stream(uint8_t sd_index, uint8_t tag,
-                                      uint16_t format,
-                                      uint64_t bdl_phys, uint16_t bdl_entries,
-                                      uint64_t buf_phys, uint32_t buf_bytes) {
-    size_t base = hda_stream_offset(sd_index);
-
-    // Stop the stream before reprogramming
-    hda_stop_stream(sd_index);
-
-    // Reset the stream descriptor
-    if (!hda_reset_stream(sd_index)) {
-        return;
-    }
-
-    // Clear status bits
-    uint8_t sts = hda_mmio_read8(base + HDA_SD_REG_STS);
-    if (sts) {
-        hda_mmio_write8(base + HDA_SD_REG_STS, sts);
-    }
-
-    // Program BDL pointer
-    hda_mmio_write32(base + HDA_SD_REG_BDLPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));
-    hda_mmio_write32(base + HDA_SD_REG_BDLPU, (uint32_t)(bdl_phys >> 32));
-
-    // Set cyclic buffer length and LVI (zero-based)
-    hda_mmio_write32(base + HDA_SD_REG_CBL, buf_bytes);
-    hda_mmio_write16(base + HDA_SD_REG_LVI, (uint16_t)(bdl_entries - 1));
-
-    // Program stream format and tag
-    hda_mmio_write16(base + HDA_SD_REG_FMT, format);
-
-    uint32_t ctl = hda_mmio_read32(base + HDA_SD_REG_CTL);
-    ctl &= ~HDA_SD_CTL_STRM_MASK;
-    ctl |= ((uint32_t)tag << HDA_SD_CTL_STRM_SHIFT);
-    ctl |= HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE;
-    hda_mmio_write32(base + HDA_SD_REG_CTL, ctl);
-}
-
-bool hda_prepare_output_stream(uint16_t format, uint32_t buffer_bytes) {
-    if (!g_hda.present || !g_hda.mmio_base) return false;
-
-    uint8_t sd_index = hda_pick_first_output_stream();
-    if (sd_index == 0xFF) {
-        return false;
-    }
-
-    if (buffer_bytes == 0 || buffer_bytes > PAGE_SIZE) {
-        buffer_bytes = PAGE_SIZE;
-    }
-
-    void* bdl_page = pmm_alloc();
-    if (!bdl_page) return false;
-    uint64_t bdl_phys = (uint64_t)(uintptr_t)bdl_page;
-    hda_bdl_entry_t* bdl = (hda_bdl_entry_t*)phys_to_virt(bdl_phys);
-
-    void* pcm_page = pmm_alloc();
-    if (!pcm_page) return false;
-    uint64_t pcm_phys = (uint64_t)(uintptr_t)pcm_page;
-    void* pcm_virt = phys_to_virt(pcm_phys);
-
-    // One-entry BDL for now
-    bdl[0].address = pcm_phys;
-    bdl[0].length  = buffer_bytes;
-    bdl[0].flags   = 1; // IOC
-
-    hda_program_output_stream(sd_index, (uint8_t)(sd_index + 1),
-                              format,
-                              bdl_phys, 1,
-                              pcm_phys, buffer_bytes);
-
-    g_hda.output_stream_index  = sd_index;
-    g_hda.output_stream_tag    = (uint8_t)(sd_index + 1);
-    g_hda.output_stream_format = format;
-    g_hda.output_buffer_bytes  = buffer_bytes;
-    g_hda.output_bdl_entries   = 1;
-    g_hda.output_bdl_phys      = bdl_phys;
-    g_hda.output_buf_phys      = pcm_phys;
-    g_hda.output_bdl_virt      = bdl;
-    g_hda.output_buf_virt      = pcm_virt;
-    g_hda.output_stream_ready  = true;
-    g_hda.output_stream_running = false;
-
-    return true;
-}
-
-bool hda_start_output_stream(void) {
-    if (!g_hda.output_stream_ready) {
-        return false;
-    }
-
-    size_t base = hda_stream_offset(g_hda.output_stream_index);
-
-    uint8_t sts = hda_mmio_read8(base + HDA_SD_REG_STS);
-    if (sts) {
-        hda_mmio_write8(base + HDA_SD_REG_STS, sts);
-    }
-
-    uint32_t ctl = hda_mmio_read32(base + HDA_SD_REG_CTL);
-    ctl |= HDA_SD_CTL_RUN;
-    hda_mmio_write32(base + HDA_SD_REG_CTL, ctl);
-
-    g_hda.output_stream_running = true;
-    return true;
-}
-
-void hda_stop_output_stream_public(void) {
-    if (!g_hda.output_stream_ready) {
-        return;
-    }
-    hda_stop_stream(g_hda.output_stream_index);
-    g_hda.output_stream_running = false;
-}
-
-bool hda_output_stream_buffer(void** out_virt, uint32_t* out_bytes) {
-    if (!g_hda.output_stream_ready) {
-        return false;
-    }
-
-    if (out_virt) {
-        *out_virt = g_hda.output_buf_virt;
-    }
-    if (out_bytes) {
-        *out_bytes = g_hda.output_buffer_bytes;
-    }
-    return true;
-}
-
-// Try CORB first (if configured) and fall back to Immediate Command on failure.
-static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
-                                         uint16_t verb, uint16_t payload,
-                                         uint32_t* out_resp) {
-    if (g_hda.corb_rirb_ok) {
-        if (hda_send_verb_corb(codec, node, verb, payload, out_resp)) {
-            return true;
-        }
-    }
-
-    return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
-}
-
-
-// -------------------- Basic output stream setup --------------------
-
-static uint8_t hda_pick_first_output_stream(void) {
-    uint8_t oss = HDA_GCAP_OSS(g_hda.gcap);
-    if (oss == 0) {
-        return 0xFF;
-    }
-    // Output streams come first in the SD block
-    return 0;
-}
-
-static void hda_program_output_stream(uint8_t sd_index, uint8_t tag,
-                                      uint16_t format,
-                                      uint64_t bdl_phys, uint16_t bdl_entries,
-                                      uint32_t buf_bytes) {
-    size_t base = hda_stream_offset(sd_index);
-
-    // Stop the stream before reprogramming
-    hda_stop_stream(sd_index);
-
-    // Reset the stream descriptor
-    if (!hda_reset_stream(sd_index)) {
-        return;
-    }
-
-    // Clear status bits
-    uint8_t sts = hda_mmio_read8(base + HDA_SD_REG_STS);
-    if (sts) {
-        hda_mmio_write8(base + HDA_SD_REG_STS, sts);
-    }
-
-    // Program BDL pointer
-    hda_mmio_write32(base + HDA_SD_REG_BDLPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));
-    hda_mmio_write32(base + HDA_SD_REG_BDLPU, (uint32_t)(bdl_phys >> 32));
-
-    // Set cyclic buffer length and LVI (zero-based)
-    hda_mmio_write32(base + HDA_SD_REG_CBL, buf_bytes);
-    hda_mmio_write16(base + HDA_SD_REG_LVI, (uint16_t)(bdl_entries - 1));
-
-    // Program stream format and tag
-    hda_mmio_write16(base + HDA_SD_REG_FMT, format);
-
-    uint32_t ctl = hda_mmio_read32(base + HDA_SD_REG_CTL);
-    ctl &= ~HDA_SD_CTL_STRM_MASK;
-    ctl |= ((uint32_t)tag << HDA_SD_CTL_STRM_SHIFT);
-    ctl |= HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE;
-    hda_mmio_write32(base + HDA_SD_REG_CTL, ctl);
-}
-
-bool hda_prepare_output_stream(uint16_t format, uint32_t buffer_bytes) {
-    if (!g_hda.present || !g_hda.mmio_base) return false;
-
-    uint8_t sd_index = hda_pick_first_output_stream();
-    if (sd_index == 0xFF) {
-        return false;
-    }
-
-    if (buffer_bytes == 0 || buffer_bytes > PAGE_SIZE) {
-        buffer_bytes = PAGE_SIZE;
-    }
-
-    void* bdl_page = pmm_alloc();
-    if (!bdl_page) return false;
-    uint64_t bdl_phys = (uint64_t)(uintptr_t)bdl_page;
-    hda_bdl_entry_t* bdl = (hda_bdl_entry_t*)phys_to_virt(bdl_phys);
-
-    void* pcm_page = pmm_alloc();
-    if (!pcm_page) return false;
-    uint64_t pcm_phys = (uint64_t)(uintptr_t)pcm_page;
-    void* pcm_virt = phys_to_virt(pcm_phys);
-
-    // One-entry BDL for now
-    bdl[0].address = pcm_phys;
-    bdl[0].length  = buffer_bytes;
-    bdl[0].flags   = 1; // IOC
-
-    hda_program_output_stream(sd_index, (uint8_t)(sd_index + 1),
-                              format,
-                              bdl_phys, 1,
-                              buffer_bytes);
-
-    g_hda.output_stream_index  = sd_index;
-    g_hda.output_stream_tag    = (uint8_t)(sd_index + 1);
-    g_hda.output_stream_format = format;
-    g_hda.output_buffer_bytes  = buffer_bytes;
-    g_hda.output_bdl_entries   = 1;
-    g_hda.output_bdl_phys      = bdl_phys;
-    g_hda.output_buf_phys      = pcm_phys;
-    g_hda.output_bdl_virt      = bdl;
-    g_hda.output_buf_virt      = pcm_virt;
-    g_hda.output_stream_ready  = true;
-    g_hda.output_stream_running = false;
-
-    return true;
-}
-
-bool hda_start_output_stream(void) {
-    if (!g_hda.output_stream_ready) {
-        return false;
-    }
-
-    size_t base = hda_stream_offset(g_hda.output_stream_index);
-
-    uint8_t sts = hda_mmio_read8(base + HDA_SD_REG_STS);
-    if (sts) {
-        hda_mmio_write8(base + HDA_SD_REG_STS, sts);
-    }
-
-    uint32_t ctl = hda_mmio_read32(base + HDA_SD_REG_CTL);
-    ctl |= HDA_SD_CTL_RUN;
-    hda_mmio_write32(base + HDA_SD_REG_CTL, ctl);
-
-    g_hda.output_stream_running = true;
-    return true;
-}
-
-void hda_stop_output_stream_public(void) {
-    if (!g_hda.output_stream_ready) {
-        return;
-    }
-    hda_stop_stream(g_hda.output_stream_index);
-    g_hda.output_stream_running = false;
-}
-
-bool hda_output_stream_buffer(void** out_virt, uint32_t* out_bytes) {
-    if (!g_hda.output_stream_ready) {
-        return false;
-    }
-
-    if (out_virt) {
-        *out_virt = g_hda.output_buf_virt;
-    }
-    if (out_bytes) {
-        *out_bytes = g_hda.output_buffer_bytes;
-    }
-    return true;
-}
-
-// Try CORB first (if configured) and fall back to Immediate Command on failure.
-static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
-                                         uint16_t verb, uint16_t payload,
-                                         uint32_t* out_resp) {
-    if (g_hda.corb_rirb_ok) {
-        if (hda_send_verb_corb(codec, node, verb, payload, out_resp)) {
-            return true;
-        }
-    }
-
-    return hda_send_verb_immediate(codec, node, verb, payload, out_resp);
-}
-
-
 // -------------------- Public API: init --------------------
 
 bool hda_init(void) {
@@ -973,18 +562,6 @@ bool hda_init(void) {
     g_hda.irq_enabled    = false;
     g_hda.rirb_irq_armed = false;
     hda_resp_queue_reset();
-
-    g_hda.output_stream_index   = 0xFF;
-    g_hda.output_stream_tag     = 0;
-    g_hda.output_stream_format  = 0;
-    g_hda.output_buffer_bytes   = 0;
-    g_hda.output_bdl_entries    = 0;
-    g_hda.output_bdl_phys       = 0;
-    g_hda.output_buf_phys       = 0;
-    g_hda.output_bdl_virt       = NULL;
-    g_hda.output_buf_virt       = NULL;
-    g_hda.output_stream_ready   = false;
-    g_hda.output_stream_running = false;
 
     // 1) PCI detect
     if (!pci_find_class_subclass(HDA_PCI_CLASS, HDA_PCI_SUBCLASS, &dev)) {

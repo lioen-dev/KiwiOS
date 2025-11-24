@@ -63,10 +63,4 @@ bool     hda_codec0_get_sub_nodes(uint8_t parent_nid,
 // Request a power state change for a codec node and optionally report the resulting state (lower 4 bits of response).
 bool     hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state);
 
-// Basic output stream setup helpers (single buffer, single BDL entry for now)
-bool     hda_prepare_output_stream(uint16_t format, uint32_t buffer_bytes);
-bool     hda_start_output_stream(void);
-void     hda_stop_output_stream_public(void);
-bool     hda_output_stream_buffer(void** out_virt, uint32_t* out_bytes);
-
 #endif // DRIVERS_HDA_H
