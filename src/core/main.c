@@ -582,6 +582,7 @@ __attribute__((naked)) void exception_handler_common(void) {
 }
 
 extern void timer_handler(uint64_t* interrupt_rsp);
+extern void hda_irq_handler(uint64_t* interrupt_rsp);
 
 __attribute__((naked)) void irq0_handler(void) {
     asm volatile (
@@ -609,6 +610,46 @@ __attribute__((naked)) void irq0_handler(void) {
         "mov $0x20, %dx\n"
         "out %al, (%dx)\n"
         
+        "pop %r15\n"
+        "pop %r14\n"
+        "pop %r13\n"
+        "pop %r12\n"
+        "pop %r11\n"
+        "pop %r10\n"
+        "pop %r9\n"
+        "pop %r8\n"
+        "pop %rbp\n"
+        "pop %rdi\n"
+        "pop %rsi\n"
+        "pop %rdx\n"
+        "pop %rcx\n"
+        "pop %rbx\n"
+        "pop %rax\n"
+        "iretq\n"
+    );
+}
+
+__attribute__((naked)) void irq_hda_handler(void) {
+    asm volatile (
+        "push %rax\n"
+        "push %rbx\n"
+        "push %rcx\n"
+        "push %rdx\n"
+        "push %rsi\n"
+        "push %rdi\n"
+        "push %rbp\n"
+        "push %r8\n"
+        "push %r9\n"
+        "push %r10\n"
+        "push %r11\n"
+        "push %r12\n"
+        "push %r13\n"
+        "push %r14\n"
+        "push %r15\n"
+
+        "mov %rsp, %rdi\n"  // Pass pointer to interrupt frame
+        "call hda_irq_handler\n"
+
         "pop %r15\n"
         "pop %r14\n"
         "pop %r13\n"
@@ -1903,6 +1944,25 @@ void kmain(void) {
             print(fb0(), "HDA: controller reset FAILED\n");
         }
 
+        uint8_t hda_irq_line = hda_get_irq_line();
+        if (hda_irq_line != 0xFF && hda_irq_line != 0 && hda_corb_rirb_ready()) {
+            uint8_t vector = (uint8_t)(32 + hda_irq_line);
+            idt_set_gate(vector, (uint64_t)irq_hda_handler);
+
+            uint8_t master_mask = inb(0x21);
+            uint8_t slave_mask  = inb(0xA1);
+            if (hda_irq_line < 8) {
+                master_mask &= (uint8_t)~(1u << hda_irq_line);
+            } else {
+                master_mask &= (uint8_t)~(1u << 2);
+                slave_mask  &= (uint8_t)~(1u << (hda_irq_line - 8));
+                outb(0xA1, slave_mask);
+            }
+            outb(0x21, master_mask);
+
+            hda_enable_interrupts();
+        }
+
         // NEW: try an Immediate Command to get codec 0 vendor ID
         uint32_t vendor = 0;
         if (hda_get_codec0_vendor_immediate(&vendor)) {
@@ -1913,37 +1973,50 @@ void kmain(void) {
             hx4(fb0(), (uint16_t)(vendor & 0xFFFF));
             print(fb0(), ")\n");
 
-                // After printing codec0 vendor, ask for its root node children
-        uint8_t start_nid = 0;
-        uint8_t node_count = 0;
-        if (hda_codec0_get_sub_nodes(0, &start_nid, &node_count)) {
-            print(fb0(), "HDA: codec0 root has ");
-            print_u32(fb0(), node_count);
-            print(fb0(), " nodes starting at NID ");
-            print_u32(fb0(), start_nid);
-            print(fb0(), "\n");
-        } else {
-            print(fb0(), "HDA: failed to read codec0 root node range\n");
-        }
+            uint8_t powered_state = 0xFF;
+            if (hda_codec0_set_power_state(0, HDA_POWER_STATE_D0, &powered_state)) {
+                if (powered_state == HDA_POWER_STATE_D0) {
+                    print(fb0(), "HDA: codec0 root entered power state D0 (fully on)\n");
+                } else {
+                    print(fb0(), "HDA: codec0 root reported power state D");
+                    print_u32(fb0(), powered_state);
+                    print(fb0(), " (expected D0)\n");
+                }
+            } else {
+                print(fb0(), "HDA: failed to set codec0 root power state\n");
+            }
 
-        // Now ask the Audio Function Group (NID 1) what *its* children are.
-        uint8_t afg_first = 0;
-        uint8_t afg_count = 0;
-        if (hda_codec0_get_sub_nodes(1, &afg_first, &afg_count)) {
-            print(fb0(), "HDA: AFG NID 1 has ");
-            print_u32(fb0(), afg_count);
-            print(fb0(), " widgets starting at NID ");
-            print_u32(fb0(), afg_first);
-            print(fb0(), "\n");
-        } else {
-            print(fb0(), "HDA: failed to read AFG (NID 1) widget range\n");
-        }
+            // After printing codec0 vendor, ask for its root node children
+            uint8_t start_nid = 0;
+            uint8_t node_count = 0;
+            if (hda_codec0_get_sub_nodes(0, &start_nid, &node_count)) {
+                print(fb0(), "HDA: codec0 root has ");
+                print_u32(fb0(), node_count);
+                print(fb0(), " nodes starting at NID ");
+                print_u32(fb0(), start_nid);
+                print(fb0(), "\n");
+            } else {
+                print(fb0(), "HDA: failed to read codec0 root node range\n");
+            }
+
+            // Now ask the Audio Function Group (NID 1) what *its* children are.
+            uint8_t afg_first = 0;
+            uint8_t afg_count = 0;
+            if (hda_codec0_get_sub_nodes(1, &afg_first, &afg_count)) {
+                print(fb0(), "HDA: AFG NID 1 has ");
+                print_u32(fb0(), afg_count);
+                print(fb0(), " widgets starting at NID ");
+                print_u32(fb0(), afg_first);
+                print(fb0(), "\n");
+            } else {
+                print(fb0(), "HDA: failed to read AFG (NID 1) widget range\n");
+            }
 
         } else {
             print(fb0(), "HDA: failed to read codec0 vendor ID (immediate)\n");
         }
 
-                // after printing reset status, before or after vendor read:
+        // after printing reset status, before or after vendor read:
         if (hda_has_codec()) {
             print(fb0(), "HDA: codec mask = 0x");
             hx4(fb0(), hda_get_codec_mask());
