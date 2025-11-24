@@ -582,6 +582,7 @@ __attribute__((naked)) void exception_handler_common(void) {
 }
 
 extern void timer_handler(uint64_t* interrupt_rsp);
+extern void hda_irq_handler(uint64_t* interrupt_rsp);
 
 __attribute__((naked)) void irq0_handler(void) {
     asm volatile (
@@ -609,6 +610,46 @@ __attribute__((naked)) void irq0_handler(void) {
         "mov $0x20, %dx\n"
         "out %al, (%dx)\n"
         
+        "pop %r15\n"
+        "pop %r14\n"
+        "pop %r13\n"
+        "pop %r12\n"
+        "pop %r11\n"
+        "pop %r10\n"
+        "pop %r9\n"
+        "pop %r8\n"
+        "pop %rbp\n"
+        "pop %rdi\n"
+        "pop %rsi\n"
+        "pop %rdx\n"
+        "pop %rcx\n"
+        "pop %rbx\n"
+        "pop %rax\n"
+        "iretq\n"
+    );
+}
+
+__attribute__((naked)) void irq_hda_handler(void) {
+    asm volatile (
+        "push %rax\n"
+        "push %rbx\n"
+        "push %rcx\n"
+        "push %rdx\n"
+        "push %rsi\n"
+        "push %rdi\n"
+        "push %rbp\n"
+        "push %r8\n"
+        "push %r9\n"
+        "push %r10\n"
+        "push %r11\n"
+        "push %r12\n"
+        "push %r13\n"
+        "push %r14\n"
+        "push %r15\n"
+
+        "mov %rsp, %rdi\n"  // Pass pointer to interrupt frame
+        "call hda_irq_handler\n"
+
         "pop %r15\n"
         "pop %r14\n"
         "pop %r13\n"
@@ -1901,6 +1942,25 @@ void kmain(void) {
             print(fb0(), "HDA: controller reset OK\n");
         } else {
             print(fb0(), "HDA: controller reset FAILED\n");
+        }
+
+        uint8_t hda_irq_line = hda_get_irq_line();
+        if (hda_irq_line != 0xFF && hda_irq_line != 0 && hda_corb_rirb_ready()) {
+            uint8_t vector = (uint8_t)(32 + hda_irq_line);
+            idt_set_gate(vector, (uint64_t)irq_hda_handler);
+
+            uint8_t master_mask = inb(0x21);
+            uint8_t slave_mask  = inb(0xA1);
+            if (hda_irq_line < 8) {
+                master_mask &= (uint8_t)~(1u << hda_irq_line);
+            } else {
+                master_mask &= (uint8_t)~(1u << 2);
+                slave_mask  &= (uint8_t)~(1u << (hda_irq_line - 8));
+                outb(0xA1, slave_mask);
+            }
+            outb(0x21, master_mask);
+
+            hda_enable_interrupts();
         }
 
         // NEW: try an Immediate Command to get codec 0 vendor ID

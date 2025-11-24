@@ -5,6 +5,7 @@
 #include "drivers/timer.h"
 #include "memory/vmm.h"   // phys_to_virt, vmm_get_kernel_page_table
 #include "memory/pmm.h"   // pmm_alloc
+#include "arch/x86/io.h"  // outb
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -102,6 +103,8 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 
 // RIRBCTL bits
 #define HDA_RIRBCTL_DMA_EN   (1u << 0)
+#define HDA_RIRBCTL_IRQ_EN   (1u << 1)
+#define HDA_RIRBCTL_OVF_EN   (1u << 2)
 
 // CORBRP bits
 #define HDA_CORBRP_RST       (1u << 15)
@@ -113,6 +116,10 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 #define HDA_CORB_RIRB_2_ENTRIES   0x0
 #define HDA_CORB_RIRB_16_ENTRIES  0x1
 #define HDA_CORB_RIRB_256_ENTRIES 0x2
+
+// RIRBSTS bits
+#define HDA_RIRBSTS_IRQ      (1u << 0)
+#define HDA_RIRBSTS_OVF      (1u << 2)
 
 // Common verbs/parameters
 #define HDA_VERB_GET_PARAMETER  0xF00
@@ -152,6 +159,15 @@ typedef struct {
 
     uint8_t  corb_wp;          // last written index
     uint16_t rirb_rp;          // last seen read pointer
+
+    // Interrupt / response handling
+    uint8_t  irq_line;         // PCI legacy IRQ line (0xFF if none)
+    bool     irq_enabled;      // PIC/IDT wired up
+    bool     rirb_irq_armed;   // RIRB interrupt enable programmed
+
+    uint64_t resp_queue[32];   // buffered RIRB responses (low 32 bits used)
+    uint8_t  resp_head;        // dequeue index
+    uint8_t  resp_tail;        // enqueue index
 } hda_controller_t;
 
 static hda_controller_t g_hda = {0};
@@ -198,6 +214,47 @@ static inline void hda_mmio_write16(size_t offset, uint16_t value) {
 
 static inline void hda_mmio_write32(size_t offset, uint32_t value) {
     *(volatile uint32_t *)(g_hda.mmio_base + offset) = value;
+}
+
+// -------------------- Response queue helpers --------------------
+
+static inline void hda_resp_queue_reset(void) {
+    g_hda.resp_head = 0;
+    g_hda.resp_tail = 0;
+}
+
+static inline void hda_resp_queue_push(uint64_t entry) {
+    uint8_t next_tail = (uint8_t)((g_hda.resp_tail + 1) & 0x1F);
+    if (next_tail == g_hda.resp_head) {
+        // Drop oldest entry on overflow
+        g_hda.resp_head = (uint8_t)((g_hda.resp_head + 1) & 0x1F);
+    }
+
+    g_hda.resp_queue[g_hda.resp_tail] = entry;
+    g_hda.resp_tail = next_tail;
+}
+
+static inline bool hda_resp_queue_pop(uint32_t* out_resp) {
+    if (g_hda.resp_head == g_hda.resp_tail)
+        return false;
+
+    uint64_t entry = g_hda.resp_queue[g_hda.resp_head];
+    g_hda.resp_head = (uint8_t)((g_hda.resp_head + 1) & 0x1F);
+
+    if (out_resp)
+        *out_resp = (uint32_t)(entry & 0xFFFFFFFFu);
+    return true;
+}
+
+static bool hda_wait_for_rirb_irq(uint8_t start_tail, uint32_t* out_resp, uint32_t timeout_ms) {
+    uint64_t deadline = hda_deadline_ms(timeout_ms);
+    while (g_hda.resp_tail == start_tail) {
+        if (timer_get_ticks() > deadline)
+            return false;
+        __asm__ volatile("pause");
+    }
+
+    return hda_resp_queue_pop(out_resp);
 }
 
 
@@ -377,6 +434,7 @@ static bool hda_init_corb_rirb(void) {
     g_hda.rirb_entries = 16;
     g_hda.corb_wp      = 0;
     g_hda.rirb_rp      = 0;
+    hda_resp_queue_reset();
 
     // 3) Program CORB/RIRB base registers
     hda_mmio_write32(HDA_REG_CORBLBASE, (uint32_t)(corb_phys & 0xFFFFFFFFu));
@@ -426,13 +484,28 @@ static bool hda_send_verb_corb(uint8_t codec, uint8_t node,
     uint8_t new_wp = (uint8_t)((g_hda.corb_wp + 1) & (corb_entries - 1));
     uint32_t cmd   = hda_make_verb(codec, node, verb, payload);
 
+    // Ensure we start from a clean queue snapshot when using interrupts.
+    if (g_hda.rirb_irq_armed) {
+        hda_resp_queue_reset();
+        g_hda.rirb_rp = hda_mmio_read16(HDA_REG_RIRBWP) & 0xFFu;
+    }
+
     g_hda.corb_virt[new_wp] = cmd;
     g_hda.corb_wp = new_wp;
 
     // 2) Notify hardware of new write pointer
     hda_mmio_write8(HDA_REG_CORBWP, new_wp);
 
-    // 3) Poll RIRBWP until it advances
+    // 3) Prefer interrupt-backed completion if available
+    if (g_hda.rirb_irq_armed) {
+        uint8_t start_tail = g_hda.resp_tail;
+        if (hda_wait_for_rirb_irq(start_tail, out_resp, 100)) {
+            return true;
+        }
+        // Fall back to polling if the interrupt never arrived
+    }
+
+    // 4) Poll RIRBWP until it advances
     uint16_t old_rp = g_hda.rirb_rp;
 
     uint64_t deadline_rirb = hda_deadline_ms(100);
@@ -485,11 +558,18 @@ static bool hda_send_verb_best_available(uint8_t codec, uint8_t node,
 bool hda_init(void) {
     pci_device_t dev;
 
+    g_hda.irq_line       = 0xFF;
+    g_hda.irq_enabled    = false;
+    g_hda.rirb_irq_armed = false;
+    hda_resp_queue_reset();
+
     // 1) PCI detect
     if (!pci_find_class_subclass(HDA_PCI_CLASS, HDA_PCI_SUBCLASS, &dev)) {
         g_hda.present = false;
         return false;
     }
+
+    g_hda.irq_line = pci_config_read8(dev.bus, dev.slot, dev.func, 0x3C);
 
     // 2) Enable MMIO + bus mastering for this controller
     pci_enable_mmio_and_bus_mastering(dev.bus, dev.slot, dev.func);
@@ -547,6 +627,24 @@ bool hda_init(void) {
         g_hda.corb_rirb_ok = false;
     }
 
+    return true;
+}
+
+bool hda_enable_interrupts(void) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.corb_rirb_ok) return false;
+
+    uint8_t rirbctl = hda_mmio_read8(HDA_REG_RIRBCTL);
+    rirbctl |= HDA_RIRBCTL_DMA_EN | HDA_RIRBCTL_IRQ_EN | HDA_RIRBCTL_OVF_EN;
+    hda_mmio_write8(HDA_REG_RIRBCTL, rirbctl);
+
+    uint8_t sts = hda_mmio_read8(HDA_REG_RIRBSTS);
+    if (sts) {
+        hda_mmio_write8(HDA_REG_RIRBSTS, sts);
+    }
+
+    g_hda.rirb_irq_armed = true;
+    g_hda.irq_enabled    = true;
     return true;
 }
 
@@ -617,6 +715,45 @@ bool hda_codec0_get_parameter(uint8_t nid, uint16_t parameter, uint32_t* out_res
                                         out_resp);
 }
 
+void hda_irq_handler(uint64_t* interrupt_rsp) {
+    (void)interrupt_rsp;
+
+    if (!g_hda.present || !g_hda.mmio_base) goto ack;
+    if (!g_hda.corb_rirb_ok) goto ack;
+
+    uint8_t sts = hda_mmio_read8(HDA_REG_RIRBSTS);
+    if ((sts & (HDA_RIRBSTS_IRQ | HDA_RIRBSTS_OVF)) == 0) {
+        goto ack;
+    }
+
+    uint16_t hw_wp = hda_mmio_read16(HDA_REG_RIRBWP) & 0xFFu;
+    uint16_t rp    = g_hda.rirb_rp;
+
+    if (g_hda.rirb_entries == 0 || !g_hda.rirb_virt) {
+        goto clear_only;
+    }
+
+    while (rp != hw_wp) {
+        rp = (uint16_t)((rp + 1) & 0xFFu);
+        uint16_t idx = (uint16_t)(rp & (g_hda.rirb_entries - 1));
+        uint64_t entry = g_hda.rirb_virt[idx];
+        hda_resp_queue_push(entry);
+    }
+
+    g_hda.rirb_rp = hw_wp;
+
+clear_only:
+    if (sts) {
+        hda_mmio_write8(HDA_REG_RIRBSTS, sts);
+    }
+
+ack:
+    if (g_hda.irq_line >= 8) {
+        outb(0xA0, 0x20);
+    }
+    outb(0x20, 0x20);
+}
+
 bool hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state) {
     if (!g_hda.present || !g_hda.mmio_base) return false;
     if (!g_hda.codec_present) return false;
@@ -633,11 +770,34 @@ bool hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_
     }
 
     uint8_t current = (uint8_t)(resp & 0x0F);
+    uint64_t deadline = hda_deadline_ms(200);
+
+    while (current != target_state) {
+        if (timer_get_ticks() > deadline) {
+            break;
+        }
+
+        uint32_t get_resp = 0;
+        if (!hda_send_verb_best_available(codec, nid,
+                                          HDA_VERB_GET_POWER_STATE,
+                                          0,
+                                          &get_resp)) {
+            break;
+        }
+
+        current = (uint8_t)(get_resp & 0x0F);
+        if (current == target_state) {
+            break;
+        }
+
+        __asm__ volatile("pause");
+    }
+
     if (out_state) {
         *out_state = current;
     }
 
-    return true;
+    return current == target_state;
 }
 
 
@@ -673,4 +833,7 @@ uint16_t hda_get_codec_mask(void) {
 }
 bool hda_corb_rirb_ready(void) {
     return g_hda.corb_rirb_ok;
+}
+uint8_t hda_get_irq_line(void) {
+    return g_hda.irq_line;
 }

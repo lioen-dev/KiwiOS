@@ -9,6 +9,16 @@
 // Initialize Intel High Definition Audio controller (if present).
 bool     hda_init(void);
 
+// Enable HDA interrupt handling once an IDT entry/PIC routing is ready.
+// Returns false if CORB/RIRB could not be armed for interrupts.
+bool     hda_enable_interrupts(void);
+
+// Return the legacy IRQ line advertised in PCI config space (0xFF if none).
+uint8_t  hda_get_irq_line(void);
+
+// IRQ handler entrypoint (called from an interrupt stub).
+void     hda_irq_handler(uint64_t* interrupt_rsp);
+
 // Power state constants for widgets/codecs.
 #define HDA_POWER_STATE_D0 0x00
 #define HDA_POWER_STATE_D3 0x03
