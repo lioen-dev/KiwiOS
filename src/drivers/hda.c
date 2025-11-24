@@ -128,10 +128,25 @@ static void* hda_map_mmio_uncached(uint64_t phys, size_t size) {
 // GetParameter parameter IDs
 #define HDA_PARAM_VENDOR_ID     0x00
 #define HDA_PARAM_NODE_COUNT    0x04
+#define HDA_PARAM_FUNCTION_TYPE 0x05
+#define HDA_PARAM_AUDIO_WIDGET_CAP 0x09
 
 // Power state verbs / values
 #define HDA_VERB_SET_POWER_STATE 0x705
 #define HDA_VERB_GET_POWER_STATE 0xF05
+
+// Function Group Type values (from GetParameter FunctionGroupType)
+#define HDA_FG_TYPE_AUDIO 0x01
+
+// Audio Widget Capability bits
+#define HDA_AWCAP_OUTPUT      (1u << 4)
+#define HDA_AWCAP_WIDGET_TYPE_SHIFT 20
+#define HDA_AWCAP_WIDGET_TYPE_MASK  0xF
+
+// Widget types (from Audio Widget Capabilities bits [23:20])
+#define HDA_WIDGET_TYPE_AUDIO_OUTPUT 0x0
+#define HDA_WIDGET_TYPE_AUDIO_INPUT  0x1
+#define HDA_WIDGET_TYPE_PIN_COMPLEX  0x4
 
 // HDA controller state
 typedef struct {
@@ -169,6 +184,12 @@ typedef struct {
     uint64_t resp_queue[32];   // buffered RIRB responses (low 32 bits used)
     uint8_t  resp_head;        // dequeue index
     uint8_t  resp_tail;        // enqueue index
+
+    // Cached discovery info for a simple playback path
+    uint8_t  afg_nid;          // first audio function group
+    uint8_t  out_dac_nid;      // first audio output converter (DAC)
+    uint8_t  out_pin_nid;      // first pin complex advertising output
+    bool     playback_path_cached;
 } hda_controller_t;
 
 static hda_controller_t g_hda = {0};
@@ -602,6 +623,10 @@ bool hda_init(void) {
     g_hda.irq_line       = 0xFF;
     g_hda.irq_enabled    = false;
     g_hda.rirb_irq_armed = false;
+    g_hda.playback_path_cached = false;
+    g_hda.afg_nid       = 0;
+    g_hda.out_dac_nid   = 0;
+    g_hda.out_pin_nid   = 0;
     hda_resp_queue_reset();
 
     // 1) PCI detect
@@ -839,6 +864,101 @@ bool hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_
     }
 
     return current == target_state;
+}
+
+
+// -------------------- Audio topology helpers --------------------
+
+static bool hda_find_first_audio_function_group(uint8_t* out_afg_nid) {
+    uint8_t fg_start = 0;
+    uint8_t fg_count = 0;
+
+    if (!hda_codec0_get_sub_nodes(0, &fg_start, &fg_count)) {
+        return false;
+    }
+
+    for (uint16_t i = 0; i < fg_count; ++i) {
+        uint8_t nid = (uint8_t)(fg_start + i);
+        uint32_t resp = 0;
+        if (!hda_codec0_get_parameter(nid, HDA_PARAM_FUNCTION_TYPE, &resp)) {
+            continue;
+        }
+
+        uint8_t fg_type = (uint8_t)(resp & 0x7F); // low 7 bits hold the type
+        if (fg_type == HDA_FG_TYPE_AUDIO) {
+            if (out_afg_nid)
+                *out_afg_nid = nid;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool hda_codec0_find_output_path(uint8_t* out_afg_nid, uint8_t* out_dac_nid, uint8_t* out_pin_nid) {
+    if (!g_hda.present || !g_hda.mmio_base) return false;
+    if (!g_hda.codec_present) return false;
+    if (!g_hda.codec_mask) return false;
+
+    if (g_hda.playback_path_cached) {
+        if (g_hda.afg_nid && g_hda.out_dac_nid && g_hda.out_pin_nid) {
+            if (out_afg_nid) *out_afg_nid = g_hda.afg_nid;
+            if (out_dac_nid) *out_dac_nid = g_hda.out_dac_nid;
+            if (out_pin_nid) *out_pin_nid = g_hda.out_pin_nid;
+            return true;
+        }
+        // cached attempt failed previously
+        return false;
+    }
+
+    uint8_t afg_nid = 0;
+    if (!hda_find_first_audio_function_group(&afg_nid)) {
+        g_hda.playback_path_cached = true;
+        return false;
+    }
+
+    uint8_t widget_start = 0;
+    uint8_t widget_count = 0;
+    if (!hda_codec0_get_sub_nodes(afg_nid, &widget_start, &widget_count)) {
+        g_hda.playback_path_cached = true;
+        return false;
+    }
+
+    uint8_t dac_nid = 0;
+    uint8_t pin_nid = 0;
+
+    for (uint16_t i = 0; i < widget_count; ++i) {
+        uint8_t nid = (uint8_t)(widget_start + i);
+        uint32_t awcap = 0;
+        if (!hda_codec0_get_parameter(nid, HDA_PARAM_AUDIO_WIDGET_CAP, &awcap)) {
+            continue;
+        }
+
+        uint8_t widget_type = (uint8_t)((awcap >> HDA_AWCAP_WIDGET_TYPE_SHIFT) & HDA_AWCAP_WIDGET_TYPE_MASK);
+
+        if (!dac_nid && widget_type == HDA_WIDGET_TYPE_AUDIO_OUTPUT) {
+            dac_nid = nid;
+        }
+
+        if (!pin_nid && widget_type == HDA_WIDGET_TYPE_PIN_COMPLEX && (awcap & HDA_AWCAP_OUTPUT)) {
+            pin_nid = nid;
+        }
+
+        if (dac_nid && pin_nid) {
+            break;
+        }
+    }
+
+    g_hda.afg_nid = afg_nid;
+    g_hda.out_dac_nid = dac_nid;
+    g_hda.out_pin_nid = pin_nid;
+    g_hda.playback_path_cached = true;
+
+    if (out_afg_nid) *out_afg_nid = afg_nid;
+    if (out_dac_nid) *out_dac_nid = dac_nid;
+    if (out_pin_nid) *out_pin_nid = pin_nid;
+
+    return (dac_nid != 0) && (pin_nid != 0);
 }
 
 
