@@ -2012,6 +2012,28 @@ void kmain(void) {
                 print(fb0(), "HDA: failed to read AFG (NID 1) widget range\n");
             }
 
+            uint8_t afg_nid = 0;
+            uint8_t dac_nid = 0;
+            uint8_t pin_nid = 0;
+
+            if (hda_codec0_find_output_path(&afg_nid, &dac_nid, &pin_nid)) {
+                print(fb0(), "HDA: first audio output path found (AFG=");
+                print_u32(fb0(), afg_nid);
+                print(fb0(), ", DAC=");
+                print_u32(fb0(), dac_nid);
+                print(fb0(), ", PIN=");
+                print_u32(fb0(), pin_nid);
+                print(fb0(), ")\n");
+
+                if (hda_codec0_power_output_path(afg_nid, dac_nid, pin_nid)) {
+                    print(fb0(), "HDA: powered playback path widgets to D0\n");
+                } else {
+                    print(fb0(), "HDA: failed to power playback path widgets\n");
+                }
+            } else {
+                print(fb0(), "HDA: failed to locate a DAC+output pin path on codec0\n");
+            }
+
         } else {
             print(fb0(), "HDA: failed to read codec0 vendor ID (immediate)\n");
         }
