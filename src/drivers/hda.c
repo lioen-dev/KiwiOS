@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 
 /* Optional PWT/PCD flags (x86-64) for uncached MMIO,
@@ -423,15 +424,55 @@ static bool hda_init_corb_rirb(void) {
     uint64_t corb_phys = (uint64_t)(uintptr_t)corb_page;
 
     void* rirb_page = pmm_alloc();
-    if (!rirb_page) return false;
+    if (!rirb_page) {
+        pmm_free(corb_page);
+        return false;
+    }
     uint64_t rirb_phys = (uint64_t)(uintptr_t)rirb_page;
 
     // CORB/RIRB live in normal RAM; use HHDM to get virtual addresses.
     g_hda.corb_virt = (uint32_t*)phys_to_virt(corb_phys);
     g_hda.rirb_virt = (uint64_t*)phys_to_virt(rirb_phys);
 
-    g_hda.corb_entries = 16;
-    g_hda.rirb_entries = 16;
+    memset(g_hda.corb_virt, 0, PAGE_SIZE);
+    memset(g_hda.rirb_virt, 0, PAGE_SIZE);
+
+    // 2a) Determine supported CORB/RIRB sizes and pick the largest common option
+    //     (prefer 256 > 16 > 2 entries).
+    uint8_t corbsize_cap = hda_mmio_read8(HDA_REG_CORBSIZE);
+    uint8_t rirbsize_cap = hda_mmio_read8(HDA_REG_RIRBSIZE);
+
+    struct {
+        uint8_t code;
+        uint16_t entries;
+        uint8_t cap_bit;
+    } size_options[] = {
+        {HDA_CORB_RIRB_256_ENTRIES, 256, 6},
+        {HDA_CORB_RIRB_16_ENTRIES,  16, 5},
+        {HDA_CORB_RIRB_2_ENTRIES,    2, 4},
+    };
+
+    uint8_t chosen_code = 0;
+    uint16_t chosen_entries = 0;
+
+    for (size_t i = 0; i < sizeof(size_options) / sizeof(size_options[0]); ++i) {
+        bool corb_ok = corbsize_cap & (1u << size_options[i].cap_bit);
+        bool rirb_ok = rirbsize_cap & (1u << size_options[i].cap_bit);
+        if (corb_ok && rirb_ok) {
+            chosen_code = size_options[i].code;
+            chosen_entries = size_options[i].entries;
+            break;
+        }
+    }
+
+    // If no common size bits were set, fall back to 16 entries (spec default).
+    if (chosen_entries == 0) {
+        chosen_code = HDA_CORB_RIRB_16_ENTRIES;
+        chosen_entries = 16;
+    }
+
+    g_hda.corb_entries = chosen_entries;
+    g_hda.rirb_entries = chosen_entries;
     g_hda.corb_wp      = 0;
     g_hda.rirb_rp      = 0;
     hda_resp_queue_reset();
@@ -443,9 +484,9 @@ static bool hda_init_corb_rirb(void) {
     hda_mmio_write32(HDA_REG_RIRBLBASE, (uint32_t)(rirb_phys & 0xFFFFFFFFu));
     hda_mmio_write32(HDA_REG_RIRBUBASE, (uint32_t)(rirb_phys >> 32));
 
-    // 4) Choose 16-entry size for both rings.
-    hda_mmio_write8(HDA_REG_CORBSIZE, HDA_CORB_RIRB_16_ENTRIES);
-    hda_mmio_write8(HDA_REG_RIRBSIZE, HDA_CORB_RIRB_16_ENTRIES);
+    // 4) Program the negotiated size for both rings.
+    hda_mmio_write8(HDA_REG_CORBSIZE, chosen_code);
+    hda_mmio_write8(HDA_REG_RIRBSIZE, chosen_code);
 
     // 5) Reset CORB/RIRB pointers
     hda_mmio_write16(HDA_REG_CORBRP, HDA_CORBRP_RST);
