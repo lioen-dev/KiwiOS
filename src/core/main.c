@@ -798,6 +798,7 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  clear      - Clear the screen\n");
     print(fb, "  about      - Show information about KiwiOS\n");
     print(fb, "  echo [msg] - Print message to the screen\n");
+    print(fb, "  beep       - Play a short test tone\n");
     print(fb, "  shutdown   - Shutdown the system\n");
     print(fb, "  reboot     - Reboot the system\n");
     print(fb, "  pcilist    - List PCI devices\n");
@@ -857,6 +858,45 @@ void cmd_echo(struct limine_framebuffer *fb, const char *args) {
 void cmd_about(struct limine_framebuffer *fb) {
     print(fb, "KiwiOS v0.1\n");
     print(fb, "A simple operating system\n");
+}
+
+void cmd_beep(struct limine_framebuffer *fb) {
+    (void)fb;
+
+    const uint32_t sample_rate = 48000; // matches current HDA init
+    const uint32_t duration_ms = 200;
+    const uint32_t frequency_hz = 440;
+    const int16_t amplitude = 16000;
+
+    size_t channels = HDA_output_channels();
+    if (channels == 0) {
+        print(fb0(), "[hda] no output channels available\n");
+        return;
+    }
+
+    size_t frames = (sample_rate * duration_ms) / 1000;
+    size_t samples = frames * channels;
+
+    int16_t *buffer = (int16_t *)kmalloc(samples * sizeof(int16_t));
+    if (!buffer) {
+        print(fb0(), "[hda] unable to allocate beep buffer\n");
+        return;
+    }
+
+    // Simple square wave
+    uint32_t period = sample_rate / frequency_hz;
+    if (period == 0) period = 1;
+
+    for (size_t i = 0; i < frames; i++) {
+        int16_t sample = ((i % period) < (period / 2)) ? amplitude : (int16_t)-amplitude;
+        for (size_t ch = 0; ch < channels; ch++) {
+            buffer[i * channels + ch] = sample;
+        }
+    }
+
+    sys_hda_write_pcm(buffer, frames);
+    extern void kfree(void *p);
+    kfree(buffer);
 }
 
 void cmd_crash(struct limine_framebuffer *fb, const char *args) {
@@ -1708,6 +1748,7 @@ struct command commands[] = {
     {"psdebug", cmd_psdebug},
     {"switch", cmd_switch},
     {"fbinfo", cmd_fbinfo},
+    {"beep", cmd_beep},
     {"reboot",   cmd_reboot},
     {"shutdown", cmd_shutdown},
     {"pcilist", cmd_pcilist},
