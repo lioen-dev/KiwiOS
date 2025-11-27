@@ -136,12 +136,32 @@ static inline void hda_reg_writelong(uint32_t reg_offset, uint32_t val){
     (*((volatile uint32_t*)(hda_mmio + reg_offset)))=(val);
 }
 
+static void hda_refill_buffer_slice(size_t index) {
+    if (!audio_device.buffer || audio_device.bdl_entry_size == 0) {
+        return;
+    }
+
+    size_t offset = index * audio_device.bdl_entry_size;
+    if (offset >= audio_device.buffer_size) {
+        return;
+    }
+
+    memset((uint8_t*)audio_device.buffer + offset, 0, audio_device.bdl_entry_size);
+}
+
 void hda_interrupt_handler(){
     // Handle buffer completion on stream 0
     uint8_t stream_status = hda_reg_readbyte(SDnSTS(0));
     if (stream_status & 0x4) { // IOC / buffer complete
+        size_t completed = audio_device.current_bdl_index;
         audio_device.buffers_completed++;
-        hda_reg_writebyte(SDnSTS(0), 0x4);
+
+        hda_refill_buffer_slice(completed);
+
+        audio_device.current_bdl_index = (audio_device.current_bdl_index + 1) %
+                                         (audio_device.bdl_entries ? audio_device.bdl_entries : 1);
+
+        hda_reg_writebyte(SDnSTS(0), stream_status);
     }
 
     // Clear global interrupt status for the handled stream
@@ -537,6 +557,10 @@ void HDA_init_stream_descriptor(){
     // Allocate and align the BDL and audio buffer
     size_t entry_size = BUFFER_SIZE / BDL_SIZE;
     audio_device.buffer_size = BUFFER_SIZE;
+    audio_device.bdl_entry_size = entry_size;
+    audio_device.bdl_entries = BDL_SIZE;
+    audio_device.current_bdl_index = 0;
+    audio_device.buffers_completed = 0;
     uint8_t* audio_buffer_raw = kmalloc(BUFFER_SIZE + 0xFF);
     uint64_t audio_buf_addr = (uint64_t)audio_buffer_raw;
     audio_buf_addr = (audio_buf_addr + 0xFF) & ~0xFFull; // 256-byte alignment
@@ -553,7 +577,7 @@ void HDA_init_stream_descriptor(){
         audio_device.bdl[i].paddr = (uint32_t)(phys & 0xFFFFFFFFu);
         audio_device.bdl[i].paddr_high = (uint32_t)(phys >> 32);
         audio_device.bdl[i].length = (uint32_t)entry_size;
-        audio_device.bdl[i].flags = (i == (BDL_SIZE - 1)) ? 0x1 : 0x0; // Interrupt on completion
+        audio_device.bdl[i].flags = 0x1; // Interrupt on completion
     }
 
     uint64_t bdl_phys = hhdm_virt_to_phys((void*)audio_device.bdl);

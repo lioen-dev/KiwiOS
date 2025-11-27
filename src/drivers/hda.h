@@ -39,6 +39,10 @@ typedef struct hda_device {
     uint16_t  rirb_read_pointer; ///< RIRB Read Pointer
 
     int       buffers_completed;
+
+    size_t    bdl_entry_size;
+    size_t    bdl_entries;
+    size_t    current_bdl_index;
 } hda_device;
 
 // Initialize the Intel High Definition Audio controller (best-effort).
