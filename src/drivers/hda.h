@@ -15,6 +15,7 @@ struct hda_bdl_entry {
 struct hda_output {
     uint8_t  codec;
     uint16_t node_id;
+    uint16_t pin_node_id;
     uint32_t sample_rate;
     int      amp_gain_steps;
     int      num_channels;

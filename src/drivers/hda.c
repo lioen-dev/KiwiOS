@@ -137,8 +137,16 @@ static inline void hda_reg_writelong(uint32_t reg_offset, uint32_t val){
 }
 
 void hda_interrupt_handler(){
-    //uint32_t int_status = hda_reg_readlong(INTSTS);
-    //TODO: THIS!
+    // Handle buffer completion on stream 0
+    uint8_t stream_status = hda_reg_readbyte(SDnSTS(0));
+    if (stream_status & 0x4) { // IOC / buffer complete
+        audio_device.buffers_completed++;
+        hda_reg_writebyte(SDnSTS(0), 0x4);
+    }
+
+    // Clear global interrupt status for the handled stream
+    hda_reg_writelong(INTSTS, 0x1);
+
     (void)rings;
     (void)kb;
 }
@@ -353,6 +361,7 @@ void HDA_widget_init(uint8_t codec, uint16_t node_id){
                 return;
             }
             hda_log("OUTPUT PIN FOUND\n");
+            audio_device.output.pin_node_id = node_id;
 
             uint32_t pin_cntl = HDA_codec_query(codec, node_id, VERB_GET_PIN_CONTROL);
             //6th bit enables the output amp stream
@@ -488,6 +497,24 @@ void HDA_reset(){
 }
 void HDA_set_default_volume(){
     HDA_set_volume(255); // max
+}
+static void HDA_power_up_output(void) {
+    if (!audio_device.output.node_id) {
+        return;
+    }
+
+    uint8_t codec = audio_device.output.codec;
+    uint16_t out_nid = audio_device.output.node_id;
+    HDA_codec_query(codec, out_nid, VERB_SET_POWER_STATE | 0x0); // D0
+
+    if (audio_device.output.pin_node_id) {
+        uint16_t pin_nid = audio_device.output.pin_node_id;
+        HDA_codec_query(codec, pin_nid, VERB_SET_POWER_STATE | 0x0);
+        uint32_t pin_cntl = HDA_codec_query(codec, pin_nid, VERB_GET_PIN_CONTROL);
+        pin_cntl |= (1 << 6); // OUT_EN
+        HDA_codec_query(codec, pin_nid, VERB_SET_PIN_CONTROL | pin_cntl);
+        HDA_codec_query(codec, pin_nid, VERB_SET_EAPD_BTL | 0x2);
+    }
 }
 void HDA_init_stream_descriptor(){
     const uint8_t stream_index = 0; // Use the first output stream descriptor
@@ -633,14 +660,25 @@ void HDA_init_dev(){
     HDA_reset();
     //TODO: the below.
     HDA_init_out_widget();
+    HDA_power_up_output();
     HDA_init_stream_descriptor();
 
     HDA_set_default_volume();
 }
 
 void HDA_set_volume(uint8_t vol){
-    (void)vol;
-    return;
+    if (!audio_device.output.node_id) {
+        return;
+    }
+
+    uint8_t codec = audio_device.output.codec;
+    uint16_t nid = audio_device.output.node_id;
+    uint8_t max_steps = audio_device.output.amp_gain_steps ? (uint8_t)audio_device.output.amp_gain_steps : 0x7F;
+    uint8_t gain = (uint8_t)(((uint32_t)vol * (uint32_t)max_steps) / 255u);
+
+    // Program both channels (left/right)
+    HDA_codec_query(codec, nid, VERB_SET_AMP_GAIN_MUTE | gain);
+    HDA_codec_query(codec, nid, VERB_SET_AMP_GAIN_MUTE | (1u << 8) | gain); // channel 1
 }
 
 void hda_init(void) {
