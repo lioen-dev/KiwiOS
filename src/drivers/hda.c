@@ -1,10 +1,19 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "limine.h"
 #include "drivers/hda.h"
 #include "drivers/pci.h"
 #include "memory/heap.h"
 #include "memory/hhdm.h"
+#include "memory/vmm.h"
+
+#ifndef PAGE_PWT
+#define PAGE_PWT (1u << 3)
+#endif
+#ifndef PAGE_PCD
+#define PAGE_PCD (1u << 4)
+#endif
 
 // Minimal print shims so we can reuse the upstream driver diagnostics.
 extern void print(struct limine_framebuffer* fb, const char* s);
@@ -471,6 +480,18 @@ void HDA_init_stream_descriptor(){
     // Placeholder for future stream descriptor initialization.
 }
 
+static void* map_mmio_uncached(uint64_t phys, size_t size) {
+    page_table_t* kpt = vmm_get_kernel_page_table();
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t base_va = (uint64_t)phys_to_virt(phys);
+    for (size_t i = 0; i < pages; ++i) {
+        uint64_t pa = phys + i * PAGE_SIZE;
+        uint64_t va = base_va + i * PAGE_SIZE;
+        vmm_map_page(kpt, va, pa, PAGE_PRESENT | PAGE_WRITE | PAGE_PWT | PAGE_PCD);
+    }
+    return (void*)base_va;
+}
+
 static bool hda_map_bar(pci_device_t* dev) {
     bool is_io = false;
     uint8_t bar_size_bits = 0;
@@ -487,8 +508,9 @@ static bool hda_map_bar(pci_device_t* dev) {
         base |= ((uint64_t)bar1 << 32);
     }
 
-    audio_device.mmio_size = bar_size_bits ? (1u << bar_size_bits) : 0;
-    hda_mmio = (volatile uint8_t*)hhdm_phys_to_virt(base);
+    size_t mmio_size = bar_size_bits ? ((size_t)1 << bar_size_bits) : 0x1000;
+    audio_device.mmio_size = mmio_size;
+    hda_mmio = (volatile uint8_t*)map_mmio_uncached(base, mmio_size);
     audio_device.mmio_base = (uint8_t*)hda_mmio;
 
     hda_log("[hda] MMIO base: 0x");
