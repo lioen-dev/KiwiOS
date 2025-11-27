@@ -898,7 +898,7 @@ void cmd_beep(struct limine_framebuffer *fb) {
         }
     }
 
-    sys_hda_write_pcm(buffer, frames);
+    HDA_enqueue_interleaved_pcm(buffer, frames);
     extern void kfree(void *p);
     kfree(buffer);
 }
