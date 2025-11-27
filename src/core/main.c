@@ -22,6 +22,7 @@
 #include "fs/ext2.h"
 #include "drivers/ahci.h"
 #include "drivers/acpi.h"
+#include "drivers/hda.h"
 
 #include "lib/string.h"
 
@@ -1880,6 +1881,9 @@ void kmain(void) {
 
     // Enable interrupts
     asm volatile ("sti");
+
+    // Initialize Intel High Definition Audio (best-effort)
+    hda_init();
 
     // === Block device and disk driver initialization ===
     blockdev_init();
