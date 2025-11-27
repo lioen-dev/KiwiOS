@@ -2,10 +2,12 @@
 #define DRIVERS_HDA_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 // Basic HDA structures derived from https://github.com/inclementine/intelHDA
 struct hda_bdl_entry {
     uint32_t paddr;
+    uint32_t paddr_high;
     uint32_t length;
     uint32_t flags;
 };
@@ -25,6 +27,7 @@ typedef struct hda_device {
     uint8_t  *mmio_base;
 
     uint32_t *buffer;
+    size_t    buffer_size;
     volatile uint32_t            *corb;   ///< Command Outbound Ring Buffer
     volatile uint32_t            *rirb;   ///< Response Inbound Ring Buffer
     volatile struct hda_bdl_entry* bdl;    ///< Buffer Descriptor List
@@ -39,5 +42,8 @@ typedef struct hda_device {
 
 // Initialize the Intel High Definition Audio controller (best-effort).
 void hda_init(void);
+
+// Write interleaved PCM samples (int16, signed) into the active buffer.
+void HDA_write_interleaved_pcm(const int16_t* samples, size_t frames);
 
 #endif // DRIVERS_HDA_H
