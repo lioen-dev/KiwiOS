@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include "limine.h"
 #include "drivers/hda.h"
 #include "drivers/pci.h"
@@ -53,6 +54,16 @@ static uint8_t kb[8];
 #define SDIN_LEN 16
 #define CORBRP  0x4a
 #define RIRBWP 0x58
+#define STREAM_DESC_BASE 0x80
+#define STREAM_DESC_OFF(n) (STREAM_DESC_BASE + (0x20 * (n)))
+#define SDnCTL(n) (STREAM_DESC_OFF((n)) + 0x00)
+#define SDnSTS(n) (STREAM_DESC_OFF((n)) + 0x03)
+#define SDnLPIB(n) (STREAM_DESC_OFF((n)) + 0x04)
+#define SDnCBL(n) (STREAM_DESC_OFF((n)) + 0x08)
+#define SDnLVI(n) (STREAM_DESC_OFF((n)) + 0x0C)
+#define SDnFMT(n) (STREAM_DESC_OFF((n)) + 0x12)
+#define SDnBDPL(n) (STREAM_DESC_OFF((n)) + 0x18)
+#define SDnBDPU(n) (STREAM_DESC_OFF((n)) + 0x1C)
 
 /* VERBS! */
 //Shifted over byte so it's easier to OR with payload
@@ -313,6 +324,8 @@ void HDA_widget_init(uint8_t codec, uint16_t node_id){
                 audio_device.output.codec = codec;
                 audio_device.output.node_id = node_id;
                 audio_device.output.amp_gain_steps = (int)((amp_capabilities >> 8) & 0x7F);
+                audio_device.output.sample_rate = 48000;
+                audio_device.output.num_channels = 2;
 
             }
             HDA_codec_query(codec, node_id, VERB_SET_EAPD_BTL | eapd_btl | 0x2);
@@ -477,7 +490,80 @@ void HDA_set_default_volume(){
     HDA_set_volume(255); // max
 }
 void HDA_init_stream_descriptor(){
-    // Placeholder for future stream descriptor initialization.
+    const uint8_t stream_index = 0; // Use the first output stream descriptor
+    const uint8_t stream_tag = 1;   // Stream tag programmed into codec
+    const uint16_t fmt = 0x11;      // 48kHz, 16-bit, 2-channel
+
+    if (!audio_device.output.node_id) {
+        hda_log("[hda] No output widget discovered; skipping stream init.\n");
+        return;
+    }
+
+    // Reset the stream descriptor
+    hda_reg_writeword(SDnCTL(stream_index), 0);
+    while (hda_reg_readword(SDnCTL(stream_index)) & 0x1) {}
+    hda_reg_writeword(SDnCTL(stream_index), 0x1);
+    while (!(hda_reg_readword(SDnCTL(stream_index)) & 0x1)) {}
+    hda_reg_writeword(SDnCTL(stream_index), 0x0);
+    while (hda_reg_readword(SDnCTL(stream_index)) & 0x1) {}
+
+    // Allocate and align the BDL and audio buffer
+    size_t entry_size = BUFFER_SIZE / BDL_SIZE;
+    audio_device.buffer_size = BUFFER_SIZE;
+    uint8_t* audio_buffer_raw = kmalloc(BUFFER_SIZE + 0xFF);
+    uint64_t audio_buf_addr = (uint64_t)audio_buffer_raw;
+    audio_buf_addr = (audio_buf_addr + 0xFF) & ~0xFFull; // 256-byte alignment
+    audio_device.buffer = (uint32_t*)audio_buf_addr;
+    memset((void*)audio_device.buffer, 0, BUFFER_SIZE);
+
+    struct hda_bdl_entry* bdl_raw = kmalloc(sizeof(struct hda_bdl_entry) * BDL_SIZE + 0x7F);
+    uint64_t bdl_addr = (uint64_t)bdl_raw;
+    bdl_addr = (bdl_addr + 0x7F) & ~0x7Full; // 128-byte alignment
+    audio_device.bdl = (struct hda_bdl_entry*)bdl_addr;
+
+    for (size_t i = 0; i < BDL_SIZE; ++i) {
+        uint64_t phys = hhdm_virt_to_phys((uint8_t*)audio_device.buffer + (i * entry_size));
+        audio_device.bdl[i].paddr = (uint32_t)(phys & 0xFFFFFFFFu);
+        audio_device.bdl[i].paddr_high = (uint32_t)(phys >> 32);
+        audio_device.bdl[i].length = (uint32_t)entry_size;
+        audio_device.bdl[i].flags = (i == (BDL_SIZE - 1)) ? 0x1 : 0x0; // Interrupt on completion
+    }
+
+    uint64_t bdl_phys = hhdm_virt_to_phys((void*)audio_device.bdl);
+    hda_reg_writelong(SDnBDPL(stream_index), (uint32_t)(bdl_phys & 0xFFFFFFFFu));
+    hda_reg_writelong(SDnBDPU(stream_index), (uint32_t)(bdl_phys >> 32));
+
+    hda_reg_writelong(SDnCBL(stream_index), BUFFER_SIZE);
+    hda_reg_writeword(SDnLVI(stream_index), (uint16_t)(BDL_SIZE - 1));
+    hda_reg_writeword(SDnFMT(stream_index), fmt);
+
+    // Program stream tag and enable interrupts
+    uint16_t ctl = (uint16_t)((stream_tag & 0xF) << 4);
+    ctl |= (1 << 2); // Enable IOC
+    hda_reg_writeword(SDnCTL(stream_index), ctl);
+
+    // Bind the stream to the codec and start the DMA engine
+    HDA_codec_query(audio_device.output.codec, audio_device.output.node_id,
+                    VERB_SET_STREAM_CHANNEL | ((uint32_t)stream_tag << 4));
+    HDA_codec_query(audio_device.output.codec, audio_device.output.node_id,
+                    VERB_SET_FORMAT | fmt);
+
+    hda_reg_writeword(SDnCTL(stream_index), (uint16_t)(ctl | (1 << 1))); // RUN
+}
+
+void HDA_write_interleaved_pcm(const int16_t* samples, size_t frames) {
+    if (!audio_device.buffer || !samples) {
+        return;
+    }
+
+    size_t channels = audio_device.output.num_channels ? (size_t)audio_device.output.num_channels : 2;
+    size_t frame_bytes = channels * sizeof(int16_t);
+    size_t max_frames = audio_device.buffer_size / frame_bytes;
+    if (frames > max_frames) {
+        frames = max_frames;
+    }
+
+    memcpy((void*)audio_device.buffer, samples, frames * frame_bytes);
 }
 
 static void* map_mmio_uncached(uint64_t phys, size_t size) {
