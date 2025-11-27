@@ -34,6 +34,12 @@ typedef struct hda_device {
     volatile struct hda_bdl_entry* bdl;    ///< Buffer Descriptor List
     volatile uint32_t            *dma_pos; ///< DMA Position in Current Buffer
 
+    int16_t  *pcm_queue;           ///< Software PCM queue (interleaved int16)
+    size_t    pcm_queue_capacity;  ///< Capacity in frames
+    size_t    pcm_queue_head;      ///< Read position (in samples)
+    size_t    pcm_queue_tail;      ///< Write position (in samples)
+    size_t    pcm_queue_samples;   ///< Samples currently queued
+
     uint32_t  corb_entries;   ///< Number of CORB entries
     uint32_t  rirb_entries;   ///< Number of RIRB entries
     uint16_t  rirb_read_pointer; ///< RIRB Read Pointer
@@ -49,6 +55,12 @@ typedef struct hda_device {
 void hda_init(void);
 
 // Write interleaved PCM samples (int16, signed) into the active buffer.
-void HDA_write_interleaved_pcm(const int16_t* samples, size_t frames);
+size_t HDA_write_interleaved_pcm(const int16_t* samples, size_t frames);
+
+// Enqueue PCM frames into the software queue.
+size_t HDA_enqueue_interleaved_pcm(const int16_t* samples, size_t frames);
+
+// Query the active output channel count.
+size_t HDA_output_channels(void);
 
 #endif // DRIVERS_HDA_H
