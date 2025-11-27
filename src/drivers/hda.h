@@ -1,4 +1,5 @@
 // src/drivers/hda.h
+// Intel HDA driver adapted from https://github.com/inclementine/intelHDA for KiwiOS
 
 #ifndef DRIVERS_HDA_H
 #define DRIVERS_HDA_H
@@ -42,7 +43,7 @@ uint16_t hda_get_codec_mask(void);
 // CORB/RIRB DMA rings status
 bool     hda_corb_rirb_ready(void);
 
-// Generic parameter query helper for the primary codec (uses CORB if available, falls back to immediate).
+// Generic parameter query helper for the primary codec (uses Immediate Command path).
 bool     hda_codec0_get_parameter(uint8_t nid, uint16_t parameter, uint32_t* out_resp);
 
 // Query primary codec vendor ID using Immediate Command.
@@ -63,10 +64,7 @@ bool     hda_codec0_get_sub_nodes(uint8_t parent_nid,
 // Request a power state change for a codec node and optionally report the resulting state (lower 4 bits of response).
 bool     hda_codec0_set_power_state(uint8_t nid, uint8_t target_state, uint8_t* out_state);
 
-// Probe for a basic playback path on the primary codec by locating the first
-// Audio Function Group, its first DAC converter, and an output-capable pin.
-// Returns true if all three were found and writes their Node IDs to the
-// provided output pointers.
+// Probe for a basic playback path on the primary codec (not implemented in the simplified port).
 bool     hda_codec0_find_output_path(uint8_t* out_afg_nid,
                                      uint8_t* out_dac_nid,
                                      uint8_t* out_pin_nid);
