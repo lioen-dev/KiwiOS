@@ -9,10 +9,12 @@
 #include "memory/pmm.h"
 #include "memory/hhdm.h"
 #include "drivers/acpi.h"
+#include "drivers/hda.h"
 #include "lib/string.h"
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 extern struct limine_framebuffer* fb0(void);
 extern void print(struct limine_framebuffer* fb, const char* s);
@@ -202,6 +204,40 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             // Check if keyboard data is available
             uint8_t status = inb(0x64);
             retval = (status & 0x01) ? 1 : 0;
+            break;
+        }
+
+        case SYS_HDA_WRITE_PCM: {
+            const int16_t* user_samples = (const int16_t*)arg1;
+            size_t frames = (size_t)arg2;
+            size_t channels = HDA_output_channels();
+            size_t frame_bytes = channels * sizeof(int16_t);
+            uint64_t total_bytes = (uint64_t)frames * (uint64_t)frame_bytes;
+
+            if (frames == 0 || total_bytes == 0 || total_bytes > SIZE_MAX) {
+                retval = 0;
+                break;
+            }
+
+            if (!is_userspace_ptr(arg1, (size_t)total_bytes)) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            int16_t* tmp = (int16_t*)kmalloc((size_t)total_bytes);
+            if (!tmp) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            // Copy from userspace
+            size_t samples_to_copy = total_bytes / sizeof(int16_t);
+            for (size_t i = 0; i < samples_to_copy; ++i) {
+                tmp[i] = user_samples[i];
+            }
+
+            retval = HDA_enqueue_interleaved_pcm(tmp, frames);
+            kfree(tmp);
             break;
         }
 

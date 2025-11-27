@@ -2,6 +2,7 @@
 #define CORE_SYSCALL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 // Syscall numbers
 #define SYS_EXIT     0
@@ -37,6 +38,9 @@
 #define SYS_REBOOT    61 // Reboot the system
 #define SYS_SHUTDOWN  62 // Shutdown the system
 
+// Audio
+#define SYS_HDA_WRITE_PCM 70  // Enqueue interleaved PCM frames
+
 // File info structure
 typedef struct {
     uint64_t size;
@@ -52,6 +56,20 @@ typedef struct {
     uint64_t pitch;
     uint16_t bpp;
 } fb_info_t;
+
+// Syscall helper for writing PCM data
+static inline size_t sys_hda_write_pcm(const int16_t* samples, size_t frames) {
+    uint64_t ret;
+    asm volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"((uint64_t)SYS_HDA_WRITE_PCM),
+          "b"((uint64_t)samples),
+          "c"((uint64_t)frames),
+          "d"(0ULL)
+        : "memory");
+    return (size_t)ret;
+}
 
 void syscall_init(void);
 void syscall_on_process_exit(uint32_t pid);

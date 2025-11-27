@@ -33,6 +33,7 @@ static uint8_t kb[8];
 
 #define BDL_SIZE                      4
 #define BUFFER_SIZE             0x10000
+#define PCM_QUEUE_FRAMES             (BUFFER_SIZE / (2 * sizeof(int16_t)))
 #define CORBSIZE 0x4E
 #define RIRBSIZE 0x5E
 #define CORBLBASE 0x40
@@ -136,6 +137,87 @@ static inline void hda_reg_writelong(uint32_t reg_offset, uint32_t val){
     (*((volatile uint32_t*)(hda_mmio + reg_offset)))=(val);
 }
 
+static inline size_t hda_channels(void) {
+    return audio_device.output.num_channels ? (size_t)audio_device.output.num_channels : 2u;
+}
+
+size_t HDA_output_channels(void) {
+    return hda_channels();
+}
+
+static void hda_pcm_queue_init(void) {
+    size_t channels = hda_channels();
+    audio_device.pcm_queue_capacity = PCM_QUEUE_FRAMES;
+    audio_device.pcm_queue_head = 0;
+    audio_device.pcm_queue_tail = 0;
+    audio_device.pcm_queue_samples = 0;
+
+    size_t samples = audio_device.pcm_queue_capacity * channels;
+    audio_device.pcm_queue = (int16_t*)kmalloc(samples * sizeof(int16_t));
+    if (audio_device.pcm_queue) {
+        memset(audio_device.pcm_queue, 0, samples * sizeof(int16_t));
+    }
+}
+
+static size_t hda_pcm_queue_space(void) {
+    size_t channels = hda_channels();
+    size_t capacity_samples = audio_device.pcm_queue_capacity * channels;
+    return capacity_samples > audio_device.pcm_queue_samples ?
+        (capacity_samples - audio_device.pcm_queue_samples) / channels : 0;
+}
+
+size_t HDA_enqueue_interleaved_pcm(const int16_t* samples, size_t frames) {
+    if (!audio_device.pcm_queue || !samples || frames == 0) {
+        return 0;
+    }
+
+    size_t channels = hda_channels();
+    size_t capacity_samples = audio_device.pcm_queue_capacity * channels;
+    size_t available_frames = hda_pcm_queue_space();
+    if (available_frames == 0) {
+        return 0;
+    }
+
+    if (frames > available_frames) {
+        frames = available_frames;
+    }
+
+    size_t samples_to_copy = frames * channels;
+    for (size_t i = 0; i < samples_to_copy; ++i) {
+        audio_device.pcm_queue[audio_device.pcm_queue_tail] = samples[i];
+        audio_device.pcm_queue_tail = (audio_device.pcm_queue_tail + 1) % capacity_samples;
+    }
+
+    audio_device.pcm_queue_samples += samples_to_copy;
+    return frames;
+}
+
+static size_t hda_pcm_dequeue(int16_t* dest, size_t frames) {
+    if (!audio_device.pcm_queue || !dest || frames == 0) {
+        return 0;
+    }
+
+    size_t channels = hda_channels();
+    size_t capacity_samples = audio_device.pcm_queue_capacity * channels;
+    size_t available_frames = audio_device.pcm_queue_samples / channels;
+    if (available_frames == 0) {
+        return 0;
+    }
+
+    if (frames > available_frames) {
+        frames = available_frames;
+    }
+
+    size_t samples_to_copy = frames * channels;
+    for (size_t i = 0; i < samples_to_copy; ++i) {
+        dest[i] = audio_device.pcm_queue[audio_device.pcm_queue_head];
+        audio_device.pcm_queue_head = (audio_device.pcm_queue_head + 1) % capacity_samples;
+    }
+
+    audio_device.pcm_queue_samples -= samples_to_copy;
+    return frames;
+}
+
 static void hda_refill_buffer_slice(size_t index) {
     if (!audio_device.buffer || audio_device.bdl_entry_size == 0) {
         return;
@@ -146,7 +228,16 @@ static void hda_refill_buffer_slice(size_t index) {
         return;
     }
 
-    memset((uint8_t*)audio_device.buffer + offset, 0, audio_device.bdl_entry_size);
+    size_t channels = hda_channels();
+    size_t frames = audio_device.bdl_entry_size / (channels * sizeof(int16_t));
+    int16_t* dest = (int16_t*)((uint8_t*)audio_device.buffer + offset);
+
+    // Default to silence
+    memset(dest, 0, audio_device.bdl_entry_size);
+
+    // Pull as many frames as are available
+    size_t dequeued = hda_pcm_dequeue(dest, frames);
+    (void)dequeued; // Keep for potential diagnostics later
 }
 
 void hda_interrupt_handler(){
@@ -602,19 +693,8 @@ void HDA_init_stream_descriptor(){
     hda_reg_writeword(SDnCTL(stream_index), (uint16_t)(ctl | (1 << 1))); // RUN
 }
 
-void HDA_write_interleaved_pcm(const int16_t* samples, size_t frames) {
-    if (!audio_device.buffer || !samples) {
-        return;
-    }
-
-    size_t channels = audio_device.output.num_channels ? (size_t)audio_device.output.num_channels : 2;
-    size_t frame_bytes = channels * sizeof(int16_t);
-    size_t max_frames = audio_device.buffer_size / frame_bytes;
-    if (frames > max_frames) {
-        frames = max_frames;
-    }
-
-    memcpy((void*)audio_device.buffer, samples, frames * frame_bytes);
+size_t HDA_write_interleaved_pcm(const int16_t* samples, size_t frames) {
+    return HDA_enqueue_interleaved_pcm(samples, frames);
 }
 
 static void* map_mmio_uncached(uint64_t phys, size_t size) {
@@ -680,7 +760,8 @@ void HDA_init_dev(){
     }
 
     audio_device.rirb_read_pointer = 0;
-    audio_device.buffer = kmalloc(1);
+    audio_device.buffer = NULL;
+    hda_pcm_queue_init();
     HDA_reset();
     //TODO: the below.
     HDA_init_out_widget();
