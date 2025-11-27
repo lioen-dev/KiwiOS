@@ -142,7 +142,7 @@ static uint32_t cursor_y = 0;
 static uint32_t fg_color = 0x00FFFFFF; // white
 static uint32_t bg_color = 0x00000000; // black
 
-// Keep this so existing code that references it still compiles, but we don't use it.
+// Start of logical row 0 within the framebuffer (in pixels, wraps at g_text_h_px).
 static uint32_t g_scroll_origin_px = 0;
 
 // Integer text scale (1=normal, 2=double, ...)
@@ -161,22 +161,22 @@ static void scroll_up_fast_vram(void) {
     const uint32_t step = CELL_H();                // rows to scroll in pixels
     if (step == 0 || step > g_text_h_px) return;
 
+    // Advance logical origin (wrap around framebuffer height)
+    g_scroll_origin_px += step;
+    if (g_scroll_origin_px >= g_text_h_px) g_scroll_origin_px -= g_text_h_px;
+
+    // Clear only the newly revealed band
+    uint32_t clear_start = (g_scroll_origin_px + g_text_h_px - step) % g_text_h_px;
+
     for (uint32_t i = 0; i < g_fb_count; i++) {
         struct limine_framebuffer *out = g_fbs[i];
         uint8_t *base   = (uint8_t *)(uintptr_t)out->address;
         size_t   pitch  = (size_t)out->pitch;
-        size_t   span   = (size_t)g_text_w_px * 4; // copy only the shared text width
 
-        // Move rows [step .. g_text_h_px-1] to [0 .. g_text_h_px-step-1]
-        for (uint32_t dst_y = 0; dst_y + step < g_text_h_px; dst_y++) {
-            uint8_t *dst = base + (size_t)dst_y       * pitch;
-            uint8_t *src = base + (size_t)(dst_y+step)* pitch;
-            memmove(dst, src, span);
-        }
-
-        // Clear the new bottom band [g_text_h_px-step .. g_text_h_px)
-        for (uint32_t y = g_text_h_px - step; y < g_text_h_px; y++) {
-            uint8_t *row = base + (size_t)y * pitch;
+        for (uint32_t dy = 0; dy < step; dy++) {
+            uint32_t phys_y = clear_start + dy;
+            if (phys_y >= g_text_h_px) phys_y -= g_text_h_px;
+            uint8_t *row = base + (size_t)phys_y * pitch;
             fill_row_span(row, g_text_w_px, bg_color);
         }
     }
@@ -195,7 +195,9 @@ static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32
 
         // Fill glyph background box
         for (uint32_t ry = 0; ry < CELL_H(); ry++) {
-            uint8_t *row = base + (size_t)(y + ry) * pitch + (size_t)x * 4;
+            uint32_t phys_y = y + ry + g_scroll_origin_px;
+            if (phys_y >= g_text_h_px) phys_y -= g_text_h_px;
+            uint8_t *row = base + (size_t)phys_y * pitch + (size_t)x * 4;
             fill_row_span(row, CELL_W(), bg);
         }
 
@@ -206,8 +208,10 @@ static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32
                 if (bits & 1) {
                     // Draw a g_scale x g_scale block
                     for (uint32_t dy = 0; dy < g_scale; dy++) {
+                        uint32_t phys_y = y + (uint32_t)src_row * g_scale + dy + g_scroll_origin_px;
+                        if (phys_y >= g_text_h_px) phys_y -= g_text_h_px;
                         uint8_t *row = base
-                                     + (size_t)(y + (uint32_t)src_row * g_scale + dy) * pitch
+                                     + (size_t)phys_y * pitch
                                      + (size_t)(x + (uint32_t)src_col * g_scale) * 4;
                         uint32_t *p = (uint32_t *)row;
                         for (uint32_t dx = 0; dx < g_scale; dx++) p[dx] = fg;
@@ -228,7 +232,7 @@ void console_set_scale(uint32_t new_scale) {
     g_scale = new_scale;
 
     // Reset layout after scale change
-    cursor_x = 0; cursor_y = 0;
+    cursor_x = 0; cursor_y = 0; g_scroll_origin_px = 0;
 
     // Clear full text area on all outputs
     for (uint32_t i = 0; i < g_fb_count; i++) {
