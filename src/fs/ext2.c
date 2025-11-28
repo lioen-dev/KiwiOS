@@ -544,6 +544,22 @@ bool ext2_listdir(ext2_fs_t* fs, const char* path, void (*cb)(const ext2_dirent_
             ext2_dirent_disk_t* de = (ext2_dirent_disk_t*)(buf + inner);
             if (de->inode && de->name_len) {
                 ext2_dirent_t e; e.ino = de->inode; e.file_type = de->file_type;
+                // Some ext2 volumes don't populate file_type in dirents unless the
+                // FEATURE_INCOMPAT_FILETYPE flag is set. Fall back to inspecting
+                // the inode's mode bits so callers (e.g., ls) can still tell
+                // directories from regular files for coloring.
+                if (e.file_type == 0) {
+                    ext2_inode_disk_t dir_inode;
+                    if (read_inode(fs, e.ino, &dir_inode)) {
+                        uint16_t mode_hi = dir_inode.mode;
+                        if ((mode_hi & 0xF000) == 0x4000) {
+                            e.file_type = 2; // directory
+                        } else {
+                            e.file_type = 1; // treat everything else as a file
+                        }
+                    }
+                }
+
                 uint32_t nl = de->name_len; if (nl >= sizeof(e.name)) nl = sizeof(e.name)-1;
                 memcpy(e.name, de->name, nl); e.name[nl] = 0;
                 if (cb) cb(&e, user);
