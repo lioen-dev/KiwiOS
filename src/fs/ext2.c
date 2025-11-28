@@ -953,6 +953,8 @@ bool ext2_mkdir(ext2_fs_t* fs, const char* path, uint16_t mode) {
     uint32_t now = now_seconds();
     ino_init.mode = (uint16_t)(0x4000 | (mode & 0x0FFF));
     ino_init.uid = 0; ino_init.gid = 0;
+    // One data block that will hold "./.." plus free space for future entries
+    // (rec_len on the last entry must consume the remaining bytes).
     ino_init.size_lo = fs->block_size;
     ino_init.atime = now; ino_init.ctime = now; ino_init.mtime = now;
     ino_init.dtime = 0;
@@ -970,12 +972,26 @@ bool ext2_mkdir(ext2_fs_t* fs, const char* path, uint16_t mode) {
 
     ext2_dirent_disk_t* dotdot = (ext2_dirent_disk_t*)(buf + dot->rec_len);
     dotdot->inode = parent_ino; dotdot->name_len = 2; dotdot->file_type = 2;
-    dotdot->rec_len = (uint16_t)(fs->block_size - dot->rec_len);
+    dotdot->rec_len = rec_len_min(2);
     dotdot->name[0] = '.'; dotdot->name[1] = '.';
+
+    // The last entry in a directory block must consume the remaining bytes so
+    // later insertions can steal slack safely. After writing the fixed-size
+    // records above, leave one empty entry that spans the remainder.
+    uint16_t used = (uint16_t)(dot->rec_len + dotdot->rec_len);
+    if (used < fs->block_size) {
+        ext2_dirent_disk_t* free_tail = (ext2_dirent_disk_t*)(buf + used);
+        free_tail->inode = 0;
+        free_tail->name_len = 0;
+        free_tail->file_type = 0;
+        free_tail->rec_len = (uint16_t)(fs->block_size - used);
+    }
 
     if (!write_block(fs, data_blk, buf)) { kfree(buf); free_inode_number(fs, new_ino, true); return false; }
     kfree(buf);
 
+    // Record actual size (dot + dotdot + slack entry) and block count.
+    ino_init.size_lo = fs->block_size;
     ino_init.blocks = count_allocated_blocks(fs, &ino_init) * (fs->block_size / 512);
     if (!write_inode(fs, new_ino, &ino_init)) { free_inode_number(fs, new_ino, true); return false; }
 
