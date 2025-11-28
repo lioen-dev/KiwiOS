@@ -175,6 +175,20 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             break;
         }
 
+        case SYS_SLEEP: {
+            uint64_t ms = arg1;
+            uint64_t start = timer_get_ticks();
+            uint64_t freq = timer_get_frequency();
+            uint64_t target = start + (ms * freq) / 1000;
+
+            while (timer_get_ticks() < target) {
+                asm volatile ("sti; hlt");
+            }
+
+            retval = 0;
+            break;
+        }
+
         case SYS_YIELD: {
             // Just return - the timer will switch us eventually
             // For now, this is a no-op, but we could force a reschedule
@@ -336,6 +350,12 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             break;
         }
 
+        case SYS_FB_FLIP: {
+            // No double buffering yet; succeed so callers don't crash.
+            retval = 0;
+            break;
+        }
+
         case SYS_BRK: {
             // arg1 = new heap end address (or 0 to query current)
             // Returns: current/new heap end address
@@ -443,6 +463,105 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                 retval = new_end;
             }
             
+            break;
+        }
+
+        case SYS_MMAP: {
+            process_t* proc = process_current();
+            uint64_t length = arg2;
+            uint64_t virt_addr = arg1;
+
+            if (!proc || !proc->page_table || length == 0) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            if (virt_addr == 0) {
+                virt_addr = PAGE_ALIGN_UP(proc->heap_end);
+                if (virt_addr < 0x40000000000ULL) {
+                    virt_addr = 0x40000000000ULL; // 4TB default mmap base
+                }
+            }
+
+            if (!is_userspace_ptr(virt_addr, length)) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            bool ok = true;
+            uint64_t mapped = 0;
+
+            for (uint64_t i = 0; i < pages; i++) {
+                uint64_t va = virt_addr + (i * PAGE_SIZE);
+                void* phys = pmm_alloc();
+
+                if (!phys) { ok = false; break; }
+
+                if (!vmm_map_page(proc->page_table, va, (uint64_t)phys,
+                                  PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
+                    pmm_free(phys);
+                    ok = false;
+                    break;
+                }
+
+                uint8_t* pv = (uint8_t*)phys_to_virt((uint64_t)phys);
+                memset(pv, 0, PAGE_SIZE);
+                mapped++;
+            }
+
+            if (!ok) {
+                for (uint64_t i = 0; i < mapped; i++) {
+                    uint64_t va = virt_addr + (i * PAGE_SIZE);
+                    uint64_t phys = vmm_get_physical(proc->page_table, va);
+                    if (phys) {
+                        vmm_unmap_page(proc->page_table, va);
+                        pmm_free((void*)phys);
+                    }
+                }
+                retval = (uint64_t)-1;
+            } else {
+                retval = virt_addr;
+            }
+            break;
+        }
+
+        case SYS_MUNMAP: {
+            process_t* proc = process_current();
+            uint64_t virt_addr = arg1;
+            uint64_t length = arg2;
+
+            if (!proc || !proc->page_table || length == 0) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            if (!is_userspace_ptr(virt_addr, length)) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            uint64_t base = virt_addr & ~(PAGE_SIZE - 1);
+            uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            for (uint64_t i = 0; i < pages; i++) {
+                uint64_t va = base + (i * PAGE_SIZE);
+                uint64_t phys = vmm_get_physical(proc->page_table, va);
+
+                if (phys) {
+                    bool is_fb = proc->fb_mapping_size &&
+                                 phys >= proc->fb_mapping_phys_base &&
+                                 phys < proc->fb_mapping_phys_base + proc->fb_mapping_size;
+
+                    vmm_unmap_page(proc->page_table, va);
+                    if (!is_fb) {
+                        pmm_free((void*)phys);
+                    }
+                }
+            }
+
+            retval = 0;
             break;
         }
 

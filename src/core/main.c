@@ -1982,7 +1982,7 @@ void cmd_touch(struct limine_framebuffer* fb, const char* args) {
     (void)fb;
     if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
     if (!args || !*args) { kputs("usage: touch <file>\n"); return; }
-    if (!ext2_replace(g_fs, args, "", 0)) kputs("touch: failed\n");
+    if (!ext2_create_empty(g_fs, args, 0644)) kputs("touch: failed\n");
 }
 
 // append <file> <text...>  (dispatcher already splits path/text)
