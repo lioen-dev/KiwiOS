@@ -993,6 +993,12 @@ static const char scancode_to_ascii_shift[] = {
 static bool shift_pressed = false;
 static bool ctrl_pressed  = false;
 static bool e0_prefix     = false;
+static int  pending_special = -1;
+
+enum {
+    KEY_ARROW_UP   = -16,
+    KEY_ARROW_DOWN = -17,
+};
 
 // Helpers for scancode press/release
 static inline bool is_shift_press(uint8_t s)   { return s == 0x2A || s == 0x36; }
@@ -1015,11 +1021,19 @@ static bool handle_extended_scancode(uint8_t scancode) {
     switch (scancode) {
         case 0x49: console_page_up();   return true;
         case 0x51: console_page_down(); return true;
+        case 0x48: pending_special = KEY_ARROW_UP;   return true; // Up arrow
+        case 0x50: pending_special = KEY_ARROW_DOWN; return true; // Down arrow
         default:   return false;
     }
 }
 
 char keyboard_getchar(void) {
+    if (pending_special != -1) {
+        char k = (char)pending_special;
+        pending_special = -1;
+        return k;
+    }
+
     for (;;) {
         // Data available?
         uint8_t status = inb(PS2_STATUS_PORT);
@@ -1031,7 +1045,14 @@ char keyboard_getchar(void) {
         if (e0_prefix) {
             bool consumed = handle_extended_scancode(scancode);
             e0_prefix = false;
-            if (consumed) continue;
+            if (consumed) {
+                if (pending_special != -1) {
+                    char k = (char)pending_special;
+                    pending_special = -1;
+                    return k;
+                }
+                continue;
+            }
         }
 
         // Track modifiers
@@ -1053,6 +1074,12 @@ char keyboard_getchar(void) {
 }
 
 int keyboard_getchar_nonblocking(void) {
+    if (pending_special != -1) {
+        char k = (char)pending_special;
+        pending_special = -1;
+        return (int)k;
+    }
+
     // Any data?
     uint8_t status = inb(PS2_STATUS_PORT);
     if (!(status & 0x01)) return -1;
@@ -1063,7 +1090,14 @@ int keyboard_getchar_nonblocking(void) {
     if (e0_prefix) {
         bool consumed = handle_extended_scancode(scancode);
         e0_prefix = false;
-        if (consumed) return -1;
+        if (consumed) {
+            if (pending_special != -1) {
+                char k = (char)pending_special;
+                pending_special = -1;
+                return (int)k;
+            }
+            return -1;
+        }
     }
 
     // Track modifiers
@@ -1894,9 +1928,8 @@ static void _ls_cb(const ext2_dirent_t* e, void* user) {
     if (e->file_type == 2) {
         fg_color = ansi_palette[12]; // bright blue for directories
         print(fb0(), e->name);
-        print(fb0(), "/");
     } else {
-        fg_color = DEFAULT_FG; // default color for regular files and others
+        fg_color = ansi_palette[6]; // default color for regular files and others
         print(fb0(), e->name);
     }
 
@@ -2147,6 +2180,60 @@ void execute_command(struct limine_framebuffer *fb, char *input) {
 // ================= Input handling =================
 #define INPUT_BUFFER_SIZE 256
 
+#define HISTORY_SIZE 32
+static char history[HISTORY_SIZE][INPUT_BUFFER_SIZE];
+static int history_count = 0;   // number of stored entries
+static int history_cursor = -1; // -1 = live typing, 0 = newest history, ...
+static char history_scratch[INPUT_BUFFER_SIZE];
+static int history_scratch_len = 0;
+
+static void history_record(const char *line) {
+    if (!line || !*line) return;
+
+    // Avoid duplicate consecutive entries
+    if (history_count > 0) {
+        const char *last = history[(history_count - 1) % HISTORY_SIZE];
+        if (strncmp(last, line, INPUT_BUFFER_SIZE) == 0) return;
+    }
+
+    size_t len = strlen(line);
+    if (len >= INPUT_BUFFER_SIZE) len = INPUT_BUFFER_SIZE - 1;
+
+    int slot = history_count % HISTORY_SIZE;
+    memcpy(history[slot], line, len);
+    history[slot][len] = '\0';
+    history_count++;
+}
+
+static void reset_history_navigation(void) {
+    history_cursor = -1;
+    history_scratch_len = 0;
+}
+
+static const char *history_fetch(int cursor_from_newest) {
+    if (cursor_from_newest < 0) return NULL;
+    if (cursor_from_newest >= history_count) return NULL;
+    int logical = history_count - 1 - cursor_from_newest;
+    return history[logical % HISTORY_SIZE];
+}
+
+static void replace_input_line(struct limine_framebuffer *fb,
+                               char *buffer, int *pos,
+                               const char *text) {
+    while (*pos > 0) {
+        putc_fb(fb, '\b');
+        (*pos)--;
+    }
+
+    const char *p = text;
+    while (*p && *pos < INPUT_BUFFER_SIZE - 1) {
+        buffer[*pos] = *p;
+        putc_fb(fb, *p);
+        (*pos)++;
+        p++;
+    }
+}
+
 void shell_loop(struct limine_framebuffer *fb) {
     char input_buffer[INPUT_BUFFER_SIZE];
     int input_pos = 0;
@@ -2157,18 +2244,47 @@ void shell_loop(struct limine_framebuffer *fb) {
     
     while (1) {
         char c = keyboard_getchar();
-        
+            if (c == KEY_ARROW_UP) {
+            if (history_cursor == -1) {
+                history_scratch_len = input_pos;
+                if (history_scratch_len > INPUT_BUFFER_SIZE - 1) history_scratch_len = INPUT_BUFFER_SIZE - 1;
+                memcpy(history_scratch, input_buffer, (size_t)history_scratch_len);
+                history_scratch[history_scratch_len] = '\0';
+            }
+
+            if (history_cursor + 1 < history_count) {
+                history_cursor++;
+                const char *entry = history_fetch(history_cursor);
+                if (entry) replace_input_line(fb, input_buffer, &input_pos, entry);
+            }
+            continue;
+        }
+
+        if (c == KEY_ARROW_DOWN) {
+            if (history_cursor > 0) {
+                history_cursor--;
+                const char *entry = history_fetch(history_cursor);
+                if (entry) replace_input_line(fb, input_buffer, &input_pos, entry);
+            } else if (history_cursor == 0) {
+                history_cursor = -1;
+                replace_input_line(fb, input_buffer, &input_pos, history_scratch);
+            }
+            continue;
+        }
+
         if (c == '\n') {
             // Execute command
             print(fb, "\n");
             input_buffer[input_pos] = '\0';
             
             if (input_pos > 0) {
+                history_record(input_buffer);
                 execute_command(fb, input_buffer);
             }
             
             // Reset for next command
             input_pos = 0;
+            reset_history_navigation();
             print_prompt();
         } else if (c == '\b') {
             // Backspace
