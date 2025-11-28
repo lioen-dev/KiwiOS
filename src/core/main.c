@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include "arch/x86/gdt.h"
 #include "limine.h"
-#include "font8x8_basic.h"
+#include "font8x16_tandy2k.h"
 #include "memory/pmm.h"
 #include "arch/x86/tss.h"
 #include "memory/vmm.h"
@@ -84,7 +84,7 @@ struct limine_framebuffer *fb0(void) {
 
 #define MAX_OUTPUTS 8
 #define GLYPH_W 8
-#define GLYPH_H 8
+#define GLYPH_H 16
 
 static struct limine_framebuffer *g_fbs[MAX_OUTPUTS];
 static uint32_t g_fb_count = 0;
@@ -132,59 +132,105 @@ static void display_init(void) {
     // Round down to glyph grid so wrapping/scrolling is identical on all displays.
     g_text_w_px = (g_text_w_px / GLYPH_W) * GLYPH_W;
     g_text_h_px = (g_text_h_px / GLYPH_H) * GLYPH_H;
+
+    update_layout_from_bounds();
+    reset_scrollback();
+    clear_outputs();
+    render_visible();
 }
 
 // ================= Text renderer (mirrored to all outputs) =================
-// Fast *actual* scrolling (VRAM block moves), plus runtime scale (1x,2x,3x,...).
+// Fast scrolling backed by a scrollback buffer and an 8x16 Tandy 2000 font.
 
-static uint32_t cursor_x = 0;
-static uint32_t cursor_y = 0;
 static uint32_t fg_color = 0x00FFFFFF; // white
 static uint32_t bg_color = 0x00000000; // black
-
-// Start of logical row 0 within the framebuffer (in pixels, wraps at g_text_h_px).
-static uint32_t g_scroll_origin_px = 0;
 
 // Integer text scale (1=normal, 2=double, ...)
 static uint32_t g_scale = 1;
 static inline uint32_t CELL_W(void){ return GLYPH_W * g_scale; }
 static inline uint32_t CELL_H(void){ return GLYPH_H * g_scale; }
 
-// ---- helpers ----
 static inline void fill_row_span(uint8_t *row_base, uint32_t pixels, uint32_t color) {
     uint32_t *p = (uint32_t *)row_base;
     for (uint32_t x = 0; x < pixels; x++) p[x] = color;
 }
 
-// Actually scroll the visible text area up by one *cell* (scale-aware) using VRAM memmoves
-static void scroll_up_fast_vram(void) {
-    const uint32_t step = CELL_H();                // rows to scroll in pixels
-    if (step == 0 || step > g_text_h_px) return;
+// Scrollback buffer ------------------------------------------------------
 
-    // Advance logical origin (wrap around framebuffer height)
-    g_scroll_origin_px += step;
-    if (g_scroll_origin_px >= g_text_h_px) g_scroll_origin_px -= g_text_h_px;
+#define MAX_COLS          512
+#define SCROLLBACK_LINES 1024
 
-    // Clear only the newly revealed band
-    uint32_t clear_start = (g_scroll_origin_px + g_text_h_px - step) % g_text_h_px;
+struct cell { char ch; uint32_t fg; uint32_t bg; };
+static struct cell g_buffer[SCROLLBACK_LINES][MAX_COLS];
 
+static uint32_t g_cols = 0;               // columns in the visible area
+static uint32_t g_rows = 0;               // rows in the visible area
+static uint32_t g_head = 0;               // logical line 0 -> g_buffer[g_head]
+static uint32_t g_line_count = 0;         // number of valid lines in buffer
+static uint32_t g_view_offset = 0;        // how many lines up from the newest view is
+static uint32_t g_cursor_col = 0;         // cursor column within the newest line
+
+static inline uint32_t wrap_line(uint32_t logical) {
+    return (g_head + logical) % SCROLLBACK_LINES;
+}
+
+static void clear_line(uint32_t logical_line) {
+    uint32_t idx = wrap_line(logical_line);
+    for (uint32_t x = 0; x < g_cols && x < MAX_COLS; x++) {
+        g_buffer[idx][x].ch = ' ';
+        g_buffer[idx][x].fg = fg_color;
+        g_buffer[idx][x].bg = bg_color;
+    }
+}
+
+static void reset_scrollback(void) {
+    g_head = 0;
+    g_line_count = 1;
+    g_view_offset = 0;
+    g_cursor_col = 0;
+    clear_line(0);
+}
+
+static void update_layout_from_bounds(void) {
+    if (CELL_W() == 0 || CELL_H() == 0) return;
+
+    g_cols = g_text_w_px / CELL_W();
+    if (g_cols > MAX_COLS) g_cols = MAX_COLS;
+    if (g_cols == 0) g_cols = 1;
+    g_text_w_px = g_cols * CELL_W();
+
+    g_rows = g_text_h_px / CELL_H();
+    if (g_rows == 0) g_rows = 1;
+    g_text_h_px = g_rows * CELL_H();
+}
+
+static uint32_t max_view_offset(void) {
+    if (g_line_count <= g_rows) return 0;
+    return g_line_count - g_rows;
+}
+
+static uint32_t view_start_line(void) {
+    uint32_t max_off = max_view_offset();
+    if (g_view_offset > max_off) g_view_offset = max_off;
+    if (g_line_count <= g_rows) return 0;
+    return g_line_count - g_rows - g_view_offset;
+}
+
+static void clear_outputs(void) {
     for (uint32_t i = 0; i < g_fb_count; i++) {
         struct limine_framebuffer *out = g_fbs[i];
-        uint8_t *base   = (uint8_t *)(uintptr_t)out->address;
-        size_t   pitch  = (size_t)out->pitch;
-
-        for (uint32_t dy = 0; dy < step; dy++) {
-            uint32_t phys_y = clear_start + dy;
-            if (phys_y >= g_text_h_px) phys_y -= g_text_h_px;
-            uint8_t *row = base + (size_t)phys_y * pitch;
+        uint8_t *base = (uint8_t *)(uintptr_t)out->address;
+        size_t pitch = (size_t)out->pitch;
+        for (uint32_t y = 0; y < g_text_h_px; y++) {
+            uint8_t *row = base + (size_t)y * pitch;
             fill_row_span(row, g_text_w_px, bg_color);
         }
     }
 }
 
-// Draw a scaled glyph directly into each framebuffer (write-only)
+// Font blitting ----------------------------------------------------------
 static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg) {
-    const uint8_t *glyph = font8x8_basic[(uint8_t)c];
+    const uint8_t *glyph = font8x16_tandy2k[(uint8_t)c];
 
     for (uint32_t i = 0; i < g_fb_count; i++) {
         struct limine_framebuffer *out = g_fbs[i];
@@ -195,9 +241,7 @@ static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32
 
         // Fill glyph background box
         for (uint32_t ry = 0; ry < CELL_H(); ry++) {
-            uint32_t phys_y = y + ry + g_scroll_origin_px;
-            if (phys_y >= g_text_h_px) phys_y -= g_text_h_px;
-            uint8_t *row = base + (size_t)phys_y * pitch + (size_t)x * 4;
+            uint8_t *row = base + (size_t)(y + ry) * pitch + (size_t)x * 4;
             fill_row_span(row, CELL_W(), bg);
         }
 
@@ -206,12 +250,9 @@ static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32
             uint8_t bits = glyph[src_row];
             for (int src_col = 0; src_col < GLYPH_W; src_col++) {
                 if (bits & 1) {
-                    // Draw a g_scale x g_scale block
                     for (uint32_t dy = 0; dy < g_scale; dy++) {
-                        uint32_t phys_y = y + (uint32_t)src_row * g_scale + dy + g_scroll_origin_px;
-                        if (phys_y >= g_text_h_px) phys_y -= g_text_h_px;
                         uint8_t *row = base
-                                     + (size_t)phys_y * pitch
+                                     + (size_t)(y + (uint32_t)src_row * g_scale + dy) * pitch
                                      + (size_t)(x + (uint32_t)src_col * g_scale) * 4;
                         uint32_t *p = (uint32_t *)row;
                         for (uint32_t dx = 0; dx < g_scale; dx++) p[dx] = fg;
@@ -223,6 +264,99 @@ static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32
     }
 }
 
+static void draw_cell(uint32_t view_row, uint32_t col, const struct cell *c) {
+    draw_char_scaled(col * CELL_W(), view_row * CELL_H(), c->ch, c->fg, c->bg);
+}
+
+static void draw_blank_cell(uint32_t view_row, uint32_t col) {
+    struct cell blank = { ' ', fg_color, bg_color };
+    draw_cell(view_row, col, &blank);
+}
+
+static void render_line_to_row(uint32_t logical_line, uint32_t view_row) {
+    uint32_t idx = wrap_line(logical_line);
+    const struct cell *line = g_buffer[idx];
+    for (uint32_t col = 0; col < g_cols; col++) {
+        draw_cell(view_row, col, &line[col]);
+    }
+}
+
+static void render_visible(void) {
+    uint32_t start = view_start_line();
+    for (uint32_t row = 0; row < g_rows; row++) {
+        uint32_t logical = start + row;
+        if (logical < g_line_count) {
+            render_line_to_row(logical, row);
+        } else {
+            for (uint32_t col = 0; col < g_cols; col++) draw_blank_cell(row, col);
+        }
+    }
+}
+
+static void scroll_view_up_one(void) {
+    const uint32_t step = CELL_H();
+    if (step == 0 || g_text_h_px < step) return;
+
+    for (uint32_t i = 0; i < g_fb_count; i++) {
+        struct limine_framebuffer *out = g_fbs[i];
+        uint8_t *base   = (uint8_t *)(uintptr_t)out->address;
+        size_t   pitch  = (size_t)out->pitch;
+
+        for (uint32_t y = 0; y + step < g_text_h_px; y++) {
+            uint8_t *dest = base + (size_t)y * pitch;
+            uint8_t *src  = dest + (size_t)step * pitch;
+            memmove(dest, src, (size_t)g_text_w_px * 4);
+        }
+
+        for (uint32_t y = g_text_h_px - step; y < g_text_h_px; y++) {
+            uint8_t *row = base + (size_t)y * pitch;
+            fill_row_span(row, g_text_w_px, bg_color);
+        }
+    }
+}
+
+static void new_line(void) {
+    if (g_line_count < SCROLLBACK_LINES) {
+        clear_line(g_line_count);
+        g_line_count++;
+    } else {
+        g_head = (g_head + 1) % SCROLLBACK_LINES;
+        clear_line(g_line_count - 1);
+    }
+
+    g_cursor_col = 0;
+
+    if (g_view_offset == 0) {
+        if (g_line_count > g_rows) {
+            scroll_view_up_one();
+            render_line_to_row(g_line_count - 1, g_rows - 1);
+        } else {
+            render_visible();
+        }
+    } else {
+        (void)view_start_line();
+    }
+}
+
+static void console_page_up(void) {
+    uint32_t max_off = max_view_offset();
+    if (max_off == 0) return;
+
+    uint32_t step = (g_rows > 1) ? (g_rows - 1) : 1;
+    if (g_view_offset + step > max_off) step = max_off - g_view_offset;
+    g_view_offset += step;
+    render_visible();
+}
+
+static void console_page_down(void) {
+    if (g_view_offset == 0) return;
+
+    uint32_t step = (g_rows > 1) ? (g_rows - 1) : 1;
+    if (step > g_view_offset) step = g_view_offset;
+    g_view_offset -= step;
+    render_visible();
+}
+
 // Public: allow shell to change scale
 void console_set_scale(uint32_t new_scale) {
     if (new_scale == 0) new_scale = 1;
@@ -231,26 +365,17 @@ void console_set_scale(uint32_t new_scale) {
 
     g_scale = new_scale;
 
-    // Reset layout after scale change
-    cursor_x = 0; cursor_y = 0; g_scroll_origin_px = 0;
-
-    // Clear full text area on all outputs
-    for (uint32_t i = 0; i < g_fb_count; i++) {
-        struct limine_framebuffer *out = g_fbs[i];
-        uint8_t *base = (uint8_t *)(uintptr_t)out->address;
-        size_t   pitch = (size_t)out->pitch;
-        for (uint32_t y = 0; y < g_text_h_px; y++) {
-            uint8_t *row = base + (size_t)y * pitch;
-            fill_row_span(row, g_text_w_px, bg_color);
-        }
-    }
+    update_layout_from_bounds();
+    clear_outputs();
+    reset_scrollback();
+    render_visible();
 }
 
 // --- Required exports (same names as your existing code) ---
 
 void scroll_up(struct limine_framebuffer *fb /*unused*/) {
     (void)fb;
-    scroll_up_fast_vram();
+    new_line();
 }
 
 void draw_char(struct limine_framebuffer *fb /*unused*/,
@@ -260,39 +385,42 @@ void draw_char(struct limine_framebuffer *fb /*unused*/,
     draw_char_scaled(x, y, c, fg, bg);
 }
 
-// Draw char at cursor (advances cursor) â€” mirrored to all outputs
+// Draw char at cursor (advances cursor) — mirrored to all outputs
 void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
     (void)fb;
 
-    if (c == '\n') {
-        cursor_x = 0;
-        cursor_y += CELL_H();
-        if (cursor_y + CELL_H() > g_text_h_px) {
-            scroll_up(NULL);
-            cursor_y = g_text_h_px - CELL_H();
-        }
-        return;
-    }
+    if (c == '\n') { new_line(); return; }
 
     if (c == '\b') {
-        if (cursor_x >= CELL_W()) {
-            cursor_x -= CELL_W();
-            draw_char_scaled(cursor_x, cursor_y, ' ', fg_color, bg_color);
+        if (g_cursor_col > 0) {
+            g_cursor_col--;
+            uint32_t logical_line = g_line_count - 1;
+            g_buffer[wrap_line(logical_line)][g_cursor_col].ch = ' ';
+            g_buffer[wrap_line(logical_line)][g_cursor_col].fg = fg_color;
+            g_buffer[wrap_line(logical_line)][g_cursor_col].bg = bg_color;
+
+            uint32_t start = view_start_line();
+            if (g_view_offset <= max_view_offset() && logical_line >= start && logical_line < start + g_rows) {
+                render_line_to_row(logical_line, logical_line - start);
+            }
         }
         return;
     }
 
-    if (cursor_x + CELL_W() > g_text_w_px) {
-        cursor_x = 0;
-        cursor_y += CELL_H();
-        if (cursor_y + CELL_H() > g_text_h_px) {
-            scroll_up(NULL);
-            cursor_y = g_text_h_px - CELL_H();
-        }
+    if (g_cursor_col >= g_cols) new_line();
+
+    uint32_t logical_line = g_line_count - 1;
+    uint32_t idx = wrap_line(logical_line);
+    g_buffer[idx][g_cursor_col].ch = c;
+    g_buffer[idx][g_cursor_col].fg = fg_color;
+    g_buffer[idx][g_cursor_col].bg = bg_color;
+
+    uint32_t start = view_start_line();
+    if (logical_line >= start && logical_line < start + g_rows && g_cursor_col < g_cols) {
+        draw_cell(logical_line - start, g_cursor_col, &g_buffer[idx][g_cursor_col]);
     }
 
-    draw_char_scaled(cursor_x, cursor_y, c, fg_color, bg_color);
-    cursor_x += CELL_W();
+    g_cursor_col++;
 }
 
 // Draw string at cursor
@@ -462,15 +590,9 @@ __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     fg_color = 0x00FFFFFF;
     bg_color = 0x00FF0000;
 
-    // Clear screen (simple, safe loop)
-    uint32_t *fb_ptr = (uint32_t *)(uintptr_t)fb->address;
-    size_t pitch = fb->pitch / 4;
-    for (uint32_t y = 0; y < fb->height; y++) {
-        for (uint32_t x = 0; x < fb->width; x++) {
-            fb_ptr[y * pitch + x] = bg_color;
-        }
-    }
-    cursor_x = cursor_y = 0;
+    clear_outputs();
+    reset_scrollback();
+    render_visible();
 
     print(fb, "\n  :3 uh oh, KERNEL PANIC!\n");
     print(fb, "===========================\n\n");
@@ -768,6 +890,7 @@ static const char scancode_to_ascii_shift[] = {
 // Add near your other keyboard state:
 static bool shift_pressed = false;
 static bool ctrl_pressed  = false;
+static bool e0_prefix     = false;
 
 // Helpers for scancode press/release
 static inline bool is_shift_press(uint8_t s)   { return s == 0x2A || s == 0x36; }
@@ -784,6 +907,16 @@ static inline char maybe_ctrlify(char c) {
     return c;
 }
 
+static bool handle_extended_scancode(uint8_t scancode) {
+    if (scancode & 0x80) return true; // ignore extended releases
+
+    switch (scancode) {
+        case 0x49: console_page_up();   return true;
+        case 0x51: console_page_down(); return true;
+        default:   return false;
+    }
+}
+
 char keyboard_getchar(void) {
     for (;;) {
         // Data available?
@@ -791,6 +924,13 @@ char keyboard_getchar(void) {
         if (!(status & 0x01)) continue;
 
         uint8_t scancode = inb(PS2_DATA_PORT);
+
+        if (scancode == 0xE0) { e0_prefix = true; continue; }
+        if (e0_prefix) {
+            bool consumed = handle_extended_scancode(scancode);
+            e0_prefix = false;
+            if (consumed) continue;
+        }
 
         // Track modifiers
         if (is_shift_press(scancode))   { shift_pressed = true;  continue; }
@@ -816,6 +956,13 @@ int keyboard_getchar_nonblocking(void) {
     if (!(status & 0x01)) return -1;
 
     uint8_t scancode = inb(PS2_DATA_PORT);
+
+    if (scancode == 0xE0) { e0_prefix = true; return -1; }
+    if (e0_prefix) {
+        bool consumed = handle_extended_scancode(scancode);
+        e0_prefix = false;
+        if (consumed) return -1;
+    }
 
     // Track modifiers
     if (is_shift_press(scancode))   { shift_pressed = true;  return -1; }
@@ -882,19 +1029,9 @@ void cmd_help(struct limine_framebuffer *fb) {
 
 void cmd_clear(struct limine_framebuffer *fb /*unused*/) {
     (void)fb;
-    g_scroll_origin_px = 0;
-    for (uint32_t i = 0; i < g_fb_count; i++) {
-        struct limine_framebuffer *out = g_fbs[i];
-        uint32_t *fb_ptr = (uint32_t *)(uintptr_t)out->address;
-        size_t pitch32 = (size_t)out->pitch / 4;
-
-        for (uint32_t y = 0; y < out->height; y++) {
-            uint32_t *row = fb_ptr + (size_t)y * pitch32;
-            for (uint32_t x = 0; x < out->width; x++) row[x] = bg_color;
-        }
-    }
-    cursor_x = 0;
-    cursor_y = 0;
+    clear_outputs();
+    reset_scrollback();
+    render_visible();
 }
 
 void cmd_echo(struct limine_framebuffer *fb, const char *args) {
