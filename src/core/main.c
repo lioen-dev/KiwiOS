@@ -1886,9 +1886,23 @@ static void fs_init(void) {
 // ls [path]
 static void _ls_cb(const ext2_dirent_t* e, void* user) {
     (void)user;
-    print(fb0(), e->name);
+    // Preserve current colors so ls does not leak styling into the shell.
+    uint32_t prev_fg = fg_color;
+    uint32_t prev_bg = bg_color;
+
     // ext2_dirent_t uses file_type: 1=regular, 2=directory
-    if (e->file_type == 2) print(fb0(), "/");
+    if (e->file_type == 2) {
+        fg_color = ansi_palette[12]; // bright blue for directories
+        print(fb0(), e->name);
+        print(fb0(), "/");
+    } else {
+        fg_color = DEFAULT_FG; // default color for regular files and others
+        print(fb0(), e->name);
+    }
+
+    // Restore prior colors for subsequent output.
+    fg_color = prev_fg;
+    bg_color = prev_bg;
     print(fb0(), "\n");
 }
 
