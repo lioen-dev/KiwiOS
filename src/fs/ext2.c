@@ -111,6 +111,10 @@ struct ext2_fs {
 
 static char g_cwd[512] = "/";
 
+// Forward declarations for helpers that are referenced before their
+// definitions lower in the file.
+bool ext2_create_empty(ext2_fs_t* fs, const char* path, uint16_t mode);
+
 // ---------------- Helpers ----------------
 static bool write_block(ext2_fs_t* fs, uint32_t blk, const void* src);
 static bool alloc_block(ext2_fs_t* fs, uint32_t* out_blk);
@@ -687,7 +691,14 @@ bool ext2_append(ext2_fs_t* fs, const char* path, const void* data, uint32_t len
     if (!fs || !path || !*path || !data || !len) return false;
 
     uint32_t ino_nr = path_to_inode(fs, path);
-    if (ino_nr == 0) return false;
+
+    // If the target does not exist yet, create an empty regular file first so
+    // that shell commands like "append" work on new paths as expected.
+    if (ino_nr == 0) {
+        if (!ext2_create_empty(fs, path, 0644)) return false;
+        ino_nr = path_to_inode(fs, path);
+        if (ino_nr == 0) return false;
+    }
 
     ext2_inode_disk_t ino;
     if (!read_inode(fs, ino_nr, &ino)) return false;
@@ -740,7 +751,12 @@ bool ext2_append(ext2_fs_t* fs, const char* path, const void* data, uint32_t len
 bool ext2_truncate(ext2_fs_t* fs, const char* path, uint32_t new_size) {
     if (!fs || !path) return false;
     uint32_t ino_nr = path_to_inode(fs, path);
-    if (ino_nr == 0) return false;
+    if (ino_nr == 0) {
+        // Create the file if it doesn't exist so truncate behaves like POSIX.
+        if (!ext2_create_empty(fs, path, 0644)) return false;
+        ino_nr = path_to_inode(fs, path);
+        if (ino_nr == 0) return false;
+    }
 
     ext2_inode_disk_t ino;
     if (!read_inode(fs, ino_nr, &ino)) return false;
