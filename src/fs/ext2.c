@@ -981,20 +981,12 @@ bool ext2_mkdir(ext2_fs_t* fs, const char* path, uint16_t mode) {
 
     ext2_dirent_disk_t* dotdot = (ext2_dirent_disk_t*)(buf + dot->rec_len);
     dotdot->inode = parent_ino; dotdot->name_len = 2; dotdot->file_type = 2;
-    dotdot->rec_len = rec_len_min(2);
+    // Let ".." consume the remaining space in the block so the slack is
+    // available for later insert_dirent splits. This matches the standard
+    // ext2 layout and avoids leaving a separate empty record that can be
+    // misinterpreted when walking the directory.
+    dotdot->rec_len = (uint16_t)(fs->block_size - dot->rec_len);
     dotdot->name[0] = '.'; dotdot->name[1] = '.';
-
-    // The last entry in a directory block must consume the remaining bytes so
-    // later insertions can steal slack safely. After writing the fixed-size
-    // records above, leave one empty entry that spans the remainder.
-    uint16_t used = (uint16_t)(dot->rec_len + dotdot->rec_len);
-    if (used < fs->block_size) {
-        ext2_dirent_disk_t* free_tail = (ext2_dirent_disk_t*)(buf + used);
-        free_tail->inode = 0;
-        free_tail->name_len = 0;
-        free_tail->file_type = 0;
-        free_tail->rec_len = (uint16_t)(fs->block_size - used);
-    }
 
     if (!write_block(fs, data_blk, buf)) { kfree(buf); free_inode_number(fs, new_ino, true); return false; }
     kfree(buf);
