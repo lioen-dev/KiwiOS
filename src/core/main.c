@@ -93,6 +93,12 @@ static uint32_t g_fb_count = 0;
 static uint32_t g_text_w_px = 0;  // usable width in pixels (min across outputs)
 static uint32_t g_text_h_px = 0;  // usable height in pixels (min across outputs)
 
+// Forward declarations for helpers used during display initialization.
+static void update_layout_from_bounds(void);
+static void reset_scrollback(void);
+static void clear_outputs(void);
+static void render_visible(void);
+
 // Call this once early in kmain(), after Limine is ready.
 static void display_init(void) {
     struct limine_framebuffer_response *resp = framebuffer_request.response;
