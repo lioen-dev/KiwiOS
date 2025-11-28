@@ -37,12 +37,9 @@ bool ext2_stat(ext2_fs_t* fs, const char* path, ext2_stat_t* st);
 bool ext2_is_dir(ext2_fs_t* fs, const char* path);
 bool ext2_is_file(ext2_fs_t* fs, const char* path);
 bool ext2_create_empty(ext2_fs_t* fs, const char* path, uint16_t mode);
-bool ext2_mkdir(ext2_fs_t* fs, const char* path, uint16_t mode);
 bool ext2_append(ext2_fs_t* fs, const char* path, const void* data, uint32_t len);
 bool ext2_truncate(ext2_fs_t* fs, const char* path, uint32_t new_size);
 bool ext2_replace(ext2_fs_t* fs, const char* path, const void* data, uint32_t len);
-bool ext2_unlink(ext2_fs_t* fs, const char* path);
-bool ext2_rmdir(ext2_fs_t* fs, const char* path);
 
 // Read a whole file into a newly kallocated buffer. Caller must kfree().
 void* ext2_read_entire_file(ext2_fs_t* fs, const char* path, size_t* out_size);
