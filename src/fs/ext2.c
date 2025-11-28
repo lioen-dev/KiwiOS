@@ -451,6 +451,12 @@ static uint32_t path_to_inode(ext2_fs_t* fs, const char* path) {
         if (!((dino.mode & 0xF000) == 0x4000)) return 0; // not a dir
 
         uint32_t size = dino.size_lo;
+        // Some directory inodes may report size 0 even though they contain a
+        // block with "."/"..". Fall back to the allocated block span so we can
+        // still walk their entries.
+        if (size == 0) {
+            size = count_allocated_blocks(fs, &dino) * fs->block_size;
+        }
         uint32_t pos = 0;
         bool found=false;
         while (pos < size) {
@@ -591,6 +597,9 @@ bool ext2_listdir(ext2_fs_t* fs, const char* path, void (*cb)(const ext2_dirent_
     if (!((id.mode & 0xF000) == 0x4000)) return false; // dir
 
     uint32_t size = id.size_lo;
+    if (size == 0) {
+        size = count_allocated_blocks(fs, &id) * fs->block_size;
+    }
     uint32_t pos = 0;
     while (pos < size) {
         uint8_t* buf = (uint8_t*)kmalloc(fs->block_size);
