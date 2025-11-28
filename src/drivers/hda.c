@@ -8,6 +8,7 @@
 #include "memory/heap.h"
 #include "memory/hhdm.h"
 #include "memory/vmm.h"
+#include "arch/x86/io.h"
 
 #ifndef PAGE_PWT
 #define PAGE_PWT (1u << 3)
@@ -20,8 +21,8 @@
 extern void print(struct limine_framebuffer* fb, const char* s);
 extern void print_hex(struct limine_framebuffer* fb, uint64_t num);
 extern struct limine_framebuffer* fb0(void);
-
-// ===== Begin code based on https://github.com/inclementine/intelHDA =====
+extern void idt_set_gate(uint8_t num, uint64_t handler);
+extern void irq_hda_handler(void);
 
 static pci_device_t g_hda_pci = {0};
 static struct hda_device audio_device;
@@ -759,14 +760,56 @@ void HDA_init_dev(){
         return;
     }
 
+    // ------------------------------------------------------------------
+    // Wire the HDA controller's legacy PCI interrupt line into our IDT
+    // and unmask it on the PIC. This is what lets hda_interrupt_handler
+    // actually run and refill the DMA ring.
+    // ------------------------------------------------------------------
+    uint8_t irq_line = pci_config_read8(g_hda_pci.bus, g_hda_pci.slot, g_hda_pci.func, 0x3C);
+
+    if (irq_line == 0xFF) {
+        hda_log("[hda] No legacy IRQ line (likely MSI-only); HDA IRQs will not fire.\n");
+    } else if (irq_line >= 16) {
+        hda_log("[hda] IRQ line >= 16 requires IOAPIC/MSI support (not implemented yet).\n");
+    } else {
+        uint8_t vector = (uint8_t)(0x20 + irq_line);   // PIC remapped to 0x20–0x2F
+
+        // Install IDT entry for this IRQ
+        idt_set_gate(vector, (uint64_t)irq_hda_handler);
+
+        // Unmask on PIC
+        uint8_t master_mask = inb(0x21);
+        uint8_t slave_mask  = inb(0xA1);
+
+        if (irq_line < 8) {
+            // Master PIC only
+            master_mask &= (uint8_t)~(1u << irq_line);
+            outb(0x21, master_mask);
+        } else {
+            // Slave PIC: unmask specific line + cascade (IRQ2) on master
+            uint8_t slave_irq = (uint8_t)(irq_line - 8);
+            slave_mask  &= (uint8_t)~(1u << slave_irq);
+            outb(0xA1, slave_mask);
+
+            master_mask &= (uint8_t)~(1u << 2); // cascade IRQ2
+            outb(0x21, master_mask);
+        }
+
+        hda_log("[hda] using IRQ line ");
+        hda_log_hex(NULL, irq_line, ", vector ");
+        hda_log_hex(NULL, vector, "\n");
+    }
+
+    // ------------------------------------------------------------------
+    // Normal HDA initialisation
+    // ------------------------------------------------------------------
     audio_device.rirb_read_pointer = 0;
     audio_device.buffer = NULL;
     hda_pcm_queue_init();
-    HDA_reset();
-    //TODO: the below.
-    HDA_init_out_widget();
-    HDA_power_up_output();
-    HDA_init_stream_descriptor();
+    HDA_reset();                // sets up controller + CORB/RIRB + enumerates widgets
+    HDA_init_out_widget();      // still a no-op, HDA_reset does the real work
+    HDA_power_up_output();      // depends on output widget being set
+    HDA_init_stream_descriptor(); // sets up DMA stream, BDL, RUN bit
 
     HDA_set_default_volume();
 }

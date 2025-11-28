@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 // Basic HDA structures derived from https://github.com/inclementine/intelHDA
 struct hda_bdl_entry {
@@ -49,6 +50,11 @@ typedef struct hda_device {
     size_t    bdl_entry_size;
     size_t    bdl_entries;
     size_t    current_bdl_index;
+
+    // IRQ / interrupt wiring info
+    uint8_t   irq_line;          // value read from PCI config space (0x3C)
+    uint8_t   irq_vector;        // IDT vector used for legacy PIC interrupt (if any)
+    bool      irq_legacy_routed; // true if we successfully routed via 8259 PIC
 } hda_device;
 
 // Initialize the Intel High Definition Audio controller (best-effort).

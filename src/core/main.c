@@ -585,6 +585,7 @@ __attribute__((naked)) void exception_handler_common(void) {
 }
 
 extern void timer_handler(uint64_t* interrupt_rsp);
+extern void hda_interrupt_handler(void);
 
 __attribute__((naked)) void irq0_handler(void) {
     asm volatile (
@@ -612,6 +613,52 @@ __attribute__((naked)) void irq0_handler(void) {
         "mov $0x20, %dx\n"
         "out %al, (%dx)\n"
         
+        "pop %r15\n"
+        "pop %r14\n"
+        "pop %r13\n"
+        "pop %r12\n"
+        "pop %r11\n"
+        "pop %r10\n"
+        "pop %r9\n"
+        "pop %r8\n"
+        "pop %rbp\n"
+        "pop %rdi\n"
+        "pop %rsi\n"
+        "pop %rdx\n"
+        "pop %rcx\n"
+        "pop %rbx\n"
+        "pop %rax\n"
+        "iretq\n"
+    );
+}
+
+// PCI HDA interrupt handler (wired via legacy PIC / Interrupt Line)
+__attribute__((naked)) void irq_hda_handler() {
+    __asm__ volatile (
+        "push %rax\n"
+        "push %rbx\n"
+        "push %rcx\n"
+        "push %rdx\n"
+        "push %rsi\n"
+        "push %rdi\n"
+        "push %rbp\n"
+        "push %r8\n"
+        "push %r9\n"
+        "push %r10\n"
+        "push %r11\n"
+        "push %r12\n"
+        "push %r13\n"
+        "push %r14\n"
+        "push %r15\n"
+
+        // hda_interrupt_handler(void) doesn't take arguments
+        "call hda_interrupt_handler\n"
+
+        // Send EOI: slave then master (safe even if on master only)
+        "mov $0x20, %al\n"
+        "out %al, $0xA0\n"
+        "out %al, $0x20\n"
+
         "pop %r15\n"
         "pop %r14\n"
         "pop %r13\n"
