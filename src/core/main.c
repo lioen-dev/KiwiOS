@@ -1045,7 +1045,14 @@ char keyboard_getchar(void) {
         if (e0_prefix) {
             bool consumed = handle_extended_scancode(scancode);
             e0_prefix = false;
-            if (consumed) continue;
+            if (consumed) {
+                if (pending_special != -1) {
+                    char k = (char)pending_special;
+                    pending_special = -1;
+                    return k;
+                }
+                continue;
+            }
         }
 
         // Track modifiers
@@ -1083,7 +1090,14 @@ int keyboard_getchar_nonblocking(void) {
     if (e0_prefix) {
         bool consumed = handle_extended_scancode(scancode);
         e0_prefix = false;
-        if (consumed) return -1;
+        if (consumed) {
+            if (pending_special != -1) {
+                char k = (char)pending_special;
+                pending_special = -1;
+                return (int)k;
+            }
+            return -1;
+        }
     }
 
     // Track modifiers
