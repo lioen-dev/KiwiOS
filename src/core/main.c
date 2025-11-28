@@ -148,8 +148,11 @@ static void display_init(void) {
 // ================= Text renderer (mirrored to all outputs) =================
 // Fast scrolling backed by a scrollback buffer and an 8x16 Tandy 2000 font.
 
-static uint32_t fg_color = 0x00FFFFFF; // white
-static uint32_t bg_color = 0x00000000; // black
+static const uint32_t DEFAULT_FG = 0x00C0C0C0; // light gray
+static const uint32_t DEFAULT_BG = 0x00000000; // black
+
+static uint32_t fg_color = 0x00C0C0C0;
+static uint32_t bg_color = 0x00000000;
 
 // Integer text scale (1=normal, 2=double, ...)
 static uint32_t g_scale = 1;
@@ -160,6 +163,28 @@ static inline void fill_row_span(uint8_t *row_base, uint32_t pixels, uint32_t co
     uint32_t *p = (uint32_t *)row_base;
     for (uint32_t x = 0; x < pixels; x++) p[x] = color;
 }
+
+// Basic ANSI color palette (0-7 normal, 8-15 bright)
+static const uint32_t ansi_palette[16] = {
+    0x00000000, // 0 black
+    0x00AA0000, // 1 red
+    0x0000AA00, // 2 green
+    0x00AA5500, // 3 yellow/brown
+    0x000000AA, // 4 blue
+    0x00AA00AA, // 5 magenta
+    0x0000AAAA, // 6 cyan
+    0x00AAAAAA, // 7 light gray
+    0x00555555, // 8 dark gray
+    0x00FF5555, // 9 bright red
+    0x0055FF55, // 10 bright green
+    0x00FFFF55, // 11 bright yellow
+    0x005555FF, // 12 bright blue
+    0x00FF55FF, // 13 bright magenta
+    0x0055FFFF, // 14 bright cyan
+    0x00FFFFFF  // 15 white
+};
+
+static void ansi_reset_state(void);
 
 // Scrollback buffer ------------------------------------------------------
 
@@ -190,6 +215,10 @@ static void clear_line(uint32_t logical_line) {
 }
 
 static void reset_scrollback(void) {
+    fg_color = DEFAULT_FG;
+    bg_color = DEFAULT_BG;
+    ansi_reset_state();
+
     g_head = 0;
     g_line_count = 1;
     g_view_offset = 0;
@@ -391,10 +420,77 @@ void draw_char(struct limine_framebuffer *fb /*unused*/,
     draw_char_scaled(x, y, c, fg, bg);
 }
 
+// ANSI escape parsing state for simple color control
+static enum { ANSI_NORMAL, ANSI_ESC, ANSI_CSI } ansi_state = ANSI_NORMAL;
+static uint32_t ansi_params[8];
+static uint32_t ansi_param_count = 0;
+
+static void ansi_reset_state(void) {
+    ansi_state = ANSI_NORMAL;
+    ansi_param_count = 0;
+    for (uint32_t i = 0; i < 8; i++) ansi_params[i] = 0;
+}
+
+static void apply_sgr_params(void) {
+    if (ansi_param_count == 0) {
+        fg_color = DEFAULT_FG;
+        bg_color = DEFAULT_BG;
+        return;
+    }
+
+    for (uint32_t i = 0; i < ansi_param_count; i++) {
+        uint32_t p = ansi_params[i];
+        if (p == 0) {
+            fg_color = DEFAULT_FG;
+            bg_color = DEFAULT_BG;
+        } else if (p == 39) {
+            fg_color = DEFAULT_FG;
+        } else if (p == 49) {
+            bg_color = DEFAULT_BG;
+        } else if (p >= 30 && p <= 37) {
+            fg_color = ansi_palette[p - 30];
+        } else if (p >= 90 && p <= 97) {
+            fg_color = ansi_palette[(p - 90) + 8];
+        } else if (p >= 40 && p <= 47) {
+            bg_color = ansi_palette[p - 40];
+        } else if (p >= 100 && p <= 107) {
+            bg_color = ansi_palette[(p - 100) + 8];
+        }
+    }
+}
+
 // Draw char at cursor (advances cursor) — mirrored to all outputs
 void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
     (void)fb;
 
+    if (ansi_state == ANSI_ESC) {
+        if (c == '[') {
+            ansi_state = ANSI_CSI;
+            ansi_param_count = 0;
+            ansi_params[0] = 0;
+        } else {
+            ansi_reset_state();
+        }
+        return;
+    } else if (ansi_state == ANSI_CSI) {
+        if (c >= '0' && c <= '9') {
+            ansi_params[ansi_param_count] = ansi_params[ansi_param_count] * 10 + (uint32_t)(c - '0');
+        } else if (c == ';') {
+            if (ansi_param_count + 1 < 8) {
+                ansi_param_count++;
+                ansi_params[ansi_param_count] = 0;
+            }
+        } else {
+            ansi_param_count++;
+            if (c == 'm') {
+                apply_sgr_params();
+            }
+            ansi_reset_state();
+        }
+        return;
+    }
+
+    if (c == '\x1B') { ansi_state = ANSI_ESC; return; }
     if (c == '\n') { new_line(); return; }
 
     if (c == '\b') {
@@ -1891,6 +1987,18 @@ void cmd_run(struct limine_framebuffer* fb, const char* args) {
     process_switch_to(proc);
 }
 
+static void print_prompt(void) {
+    const char *cwd = "/";
+    if (g_fs) {
+        const char *fs_cwd = ext2_get_cwd();
+        if (fs_cwd && *fs_cwd) cwd = fs_cwd;
+    }
+
+    print(NULL, "\x1b[32m");
+    print(NULL, cwd);
+    print(NULL, "\x1b[0m > ");
+}
+
 void cmd_scale(struct limine_framebuffer *fb, const char *args) {
     (void)fb;
     // parse unsigned int from args; default 1 if missing/invalid
@@ -2028,10 +2136,10 @@ void execute_command(struct limine_framebuffer *fb, char *input) {
 void shell_loop(struct limine_framebuffer *fb) {
     char input_buffer[INPUT_BUFFER_SIZE];
     int input_pos = 0;
-    
+
     print(fb, "Welcome to kiwiOS!\n");
     print(fb, "Type 'help' for available commands\n\n");
-    print(fb, "> ");
+    print_prompt();
     
     while (1) {
         char c = keyboard_getchar();
@@ -2047,7 +2155,7 @@ void shell_loop(struct limine_framebuffer *fb) {
             
             // Reset for next command
             input_pos = 0;
-            print(fb, "> ");
+            print_prompt();
         } else if (c == '\b') {
             // Backspace
             if (input_pos > 0) {
