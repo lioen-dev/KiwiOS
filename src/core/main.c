@@ -1146,6 +1146,9 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  cat <file>     - Display file contents\n");
     print(fb, "  run <file>     - Execute a program\n");
     print(fb, "  touch <file>   - Create an empty file\n");
+    print(fb, "  mkdir <dir>    - Create a directory\n");
+    print(fb, "  rm <path>      - Remove a file\n");
+    print(fb, "  rmdir <dir>    - Remove an empty directory\n");
     print(fb, "  append <file> <text> - Append text to a file\n");
     print(fb, "  truncate <file> <size> - Truncate file to size bytes\n");
 
@@ -1985,6 +1988,27 @@ void cmd_touch(struct limine_framebuffer* fb, const char* args) {
     if (!ext2_create_empty(g_fs, args, 0644)) kputs("touch: failed\n");
 }
 
+void cmd_mkdir(struct limine_framebuffer* fb, const char* args) {
+    (void)fb;
+    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
+    if (!args || !*args) { kputs("usage: mkdir <path>\n"); return; }
+    if (!ext2_mkdir(g_fs, args, 0755)) kputs("mkdir: failed\n");
+}
+
+void cmd_rmdir(struct limine_framebuffer* fb, const char* args) {
+    (void)fb;
+    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
+    if (!args || !*args) { kputs("usage: rmdir <path>\n"); return; }
+    if (!ext2_rmdir(g_fs, args)) kputs("rmdir: failed\n");
+}
+
+void cmd_rm(struct limine_framebuffer* fb, const char* args) {
+    (void)fb;
+    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
+    if (!args || !*args) { kputs("usage: rm <path>\n"); return; }
+    if (!ext2_unlink(g_fs, args)) kputs("rm: failed\n");
+}
+
 // append <file> <text...>  (dispatcher already splits path/text)
 void cmd_append(struct limine_framebuffer* fb, const char* path, const char* text) {
     (void)fb;
@@ -2139,6 +2163,9 @@ void execute_command(struct limine_framebuffer *fb, char *input) {
     if (strcmp(input, "cat") == 0)   { cmd_cat(fb, args); return; }
     if (strcmp(input, "run") == 0)   { cmd_run(fb, args); return; }
     if (strcmp(input, "touch") == 0) { cmd_touch(fb, args); return; }
+    if (strcmp(input, "mkdir") == 0) { cmd_mkdir(fb, args); return; }
+    if (strcmp(input, "rm") == 0) { cmd_rm(fb, args); return; }
+    if (strcmp(input, "rmdir") == 0) { cmd_rmdir(fb, args); return; }
 
     if (strcmp(input, "append") == 0) {
         if (!args || !*args) { print(fb0(), "usage: append <path> <text>\n"); return; }
