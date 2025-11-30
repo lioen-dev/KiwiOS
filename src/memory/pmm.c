@@ -11,6 +11,7 @@ static uint8_t* bitmap = NULL;
 static size_t bitmap_size = 0; // size in bytes
 static size_t total_pages = 0;
 static size_t used_pages = 0;
+static size_t search_cursor = 0; // Hint for next allocation
 
 // Highest physical address we know about
 static uint64_t highest_addr = 0;
@@ -28,6 +29,30 @@ static inline void bitmap_clear(size_t index) {
 // Helper: Test if a bit is set
 static inline bool bitmap_test(size_t index) {
     return bitmap[index / 8] & (1 << (index % 8));
+}
+
+// Try to allocate a contiguous run of pages within [start, end)
+static void* allocate_run_from(size_t start, size_t end, size_t count) {
+    size_t idx = start;
+    while (idx + count <= end) {
+        size_t run_length = 0;
+        while (idx + run_length < end && run_length < count && !bitmap_test(idx + run_length)) {
+            run_length++;
+        }
+
+        if (run_length == count) {
+            for (size_t j = 0; j < count; j++) {
+                bitmap_set(idx + j);
+            }
+            used_pages += count;
+            search_cursor = (idx + count) % total_pages;
+            return (void*)(idx * PAGE_SIZE);
+        }
+
+        // Skip past the used page that ended the run
+        idx += run_length + 1;
+    }
+    return NULL;
 }
 
 void pmm_init(struct limine_memmap_response* memmap) {
@@ -94,19 +119,24 @@ void pmm_init(struct limine_memmap_response* memmap) {
             used_pages++;
         }
     }
+
+    search_cursor = 0;
 }
 
 void* pmm_alloc(void) {
-    // Find first free page
-    for (size_t i = 0; i < total_pages; i++) {
-        if (!bitmap_test(i)) {
-            // Found a free page!
-            bitmap_set(i);
+    if (total_pages == 0) return NULL;
+
+    // Find next free page, starting from the cursor to avoid full rescans
+    for (size_t scanned = 0; scanned < total_pages; scanned++) {
+        size_t idx = (search_cursor + scanned) % total_pages;
+        if (!bitmap_test(idx)) {
+            bitmap_set(idx);
             used_pages++;
-            return (void*)(i * PAGE_SIZE);
+            search_cursor = (idx + 1) % total_pages;
+            return (void*)(idx * PAGE_SIZE);
         }
     }
-    
+
     // No free pages
     return NULL;
 }
@@ -121,39 +151,23 @@ void pmm_free(void* addr) {
     
     bitmap_clear(page_index);
     used_pages--;
+    if (page_index < search_cursor) {
+        search_cursor = page_index;
+    }
 }
 
 void* pmm_alloc_pages(size_t count) {
     if (count == 0) return NULL;
+    if (count > total_pages) return NULL;
     if (count == 1) return pmm_alloc();
-    
-    // Find 'count' contiguous free pages
-    size_t run_start = 0;
-    size_t run_length = 0;
-    
-    for (size_t i = 0; i < total_pages; i++) {
-        if (!bitmap_test(i)) {
-            // Free page - extend run
-            if (run_length == 0) {
-                run_start = i;
-            }
-            run_length++;
-            
-            if (run_length == count) {
-                // Found enough pages!
-                // Mark them all as used
-                for (size_t j = run_start; j < run_start + count; j++) {
-                    bitmap_set(j);
-                }
-                used_pages += count;
-                return (void*)(run_start * PAGE_SIZE);
-            }
-        } else {
-            // Used page - reset run
-            run_length = 0;
-        }
+
+    // Try from cursor to the end, then wrap around
+    void* result = allocate_run_from(search_cursor, total_pages, count);
+    if (!result && search_cursor > 0) {
+        result = allocate_run_from(0, search_cursor, count);
     }
-    
+    if (result) return result;
+
     // Couldn't find enough contiguous pages
     return NULL;
 }
@@ -170,6 +184,9 @@ void pmm_free_pages(void* addr, size_t count) {
         if (bitmap_test(page_index)) {
             bitmap_clear(page_index);
             used_pages--;
+            if (page_index < search_cursor) {
+                search_cursor = page_index;
+            }
         }
     }
 }

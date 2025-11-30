@@ -1,5 +1,6 @@
 #include "memory/vmm.h"
 #include "memory/pmm.h"
+#include "memory/heap.h"
 #include "lib/string.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -22,13 +23,17 @@ void vmm_init(void) {
     // We just need to get the current CR3 value (PML4 address)
     uint64_t cr3;
     asm volatile ("mov %%cr3, %0" : "=r"(cr3));
-    
-    // Create kernel page table structure
-    kernel_page_table = (page_table_t*)phys_to_virt((uint64_t)pmm_alloc());
+
+    // Create kernel page table structure in the heap and zero it out
+    kernel_page_table = (page_table_t*)kcalloc(1, sizeof(page_table_t));
     if (!kernel_page_table) return;
-    
+
     kernel_page_table->pml4_phys = (uint64_t*)(cr3 & ~0xFFFULL);
     kernel_page_table->pml4_virt = phys_to_virt((uint64_t)kernel_page_table->pml4_phys);
+    if (!kernel_page_table->pml4_virt) {
+        kfree(kernel_page_table);
+        kernel_page_table = NULL;
+    }
 }
 
 page_table_t* vmm_get_kernel_page_table(void) {
@@ -42,18 +47,23 @@ void vmm_switch_page_table(page_table_t* pt) {
 
 page_table_t* vmm_create_page_table(void) {
     // Allocate structure
-    page_table_t* pt = (page_table_t*)phys_to_virt((uint64_t)pmm_alloc());
+    page_table_t* pt = (page_table_t*)kcalloc(1, sizeof(page_table_t));
     if (!pt) return NULL;
-    
+
     // Allocate PML4
     uint64_t pml4_phys = (uint64_t)pmm_alloc();
     if (!pml4_phys) {
-        pmm_free(pt);
+        kfree(pt);
         return NULL;
     }
     
     pt->pml4_phys = (uint64_t*)pml4_phys;
     pt->pml4_virt = phys_to_virt(pml4_phys);
+    if (!pt->pml4_virt) {
+        pmm_free((void*)pml4_phys);
+        kfree(pt);
+        return NULL;
+    }
     
     // Clear the PML4
     memset(pt->pml4_virt, 0, PAGE_SIZE);
@@ -70,24 +80,31 @@ page_table_t* vmm_create_page_table(void) {
 }
 
 // Helper: Get or create a page table at the given entry
-static uint64_t* get_or_create_table(uint64_t* table, size_t index) {
+static uint64_t* get_or_create_table(uint64_t* table, size_t index, bool user_accessible) {
     uint64_t entry = table[index];
-    
+
     if (entry & PAGE_PRESENT) {
-        // Table already exists
+        // Table already exists - upgrade permissions if needed
+        if (user_accessible && !(entry & PAGE_USER)) {
+            table[index] |= PAGE_USER;
+        }
         return (uint64_t*)phys_to_virt(PTE_GET_ADDR(entry));
     }
-    
+
     // Need to create a new table
     uint64_t new_table_phys = (uint64_t)pmm_alloc();
     if (!new_table_phys) return NULL;
-    
+
     uint64_t* new_table_virt = phys_to_virt(new_table_phys);
     memset(new_table_virt, 0, PAGE_SIZE);
-    
+
     // Set the entry to point to the new table
-    table[index] = new_table_phys | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
-    
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITE;
+    if (user_accessible) {
+        flags |= PAGE_USER;
+    }
+    table[index] = new_table_phys | flags;
+
     return new_table_virt;
 }
 
@@ -105,13 +122,15 @@ bool vmm_map_page(page_table_t* pt, uint64_t virt, uint64_t phys, uint64_t flags
     size_t pt_idx = PT_INDEX(virt);
     
     // Walk/create page tables
-    uint64_t* pdpt = get_or_create_table(pt->pml4_virt, pml4_idx);
+    bool user_accessible = (flags & PAGE_USER) != 0;
+
+    uint64_t* pdpt = get_or_create_table(pt->pml4_virt, pml4_idx, user_accessible);
     if (!pdpt) return false;
-    
-    uint64_t* pd = get_or_create_table(pdpt, pdpt_idx);
+
+    uint64_t* pd = get_or_create_table(pdpt, pdpt_idx, user_accessible);
     if (!pd) return false;
-    
-    uint64_t* page_table = get_or_create_table(pd, pd_idx);
+
+    uint64_t* page_table = get_or_create_table(pd, pd_idx, user_accessible);
     if (!page_table) return false;
     
     // Set the final page table entry
