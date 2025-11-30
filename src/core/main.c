@@ -1574,6 +1574,9 @@ void cmd_pslist(struct limine_framebuffer *fb) {
             case PROCESS_RUNNING:
                 print(fb, "RUNNING   ");
                 break;
+            case PROCESS_SLEEPING:
+                print(fb, "SLEEPING  ");
+                break;
             case PROCESS_TERMINATED:
                 print(fb, "TERMINATED");
                 break;
