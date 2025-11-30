@@ -82,58 +82,70 @@ typedef struct {
     uint64_t rip, cs, rflags, rsp, ss;
 } syscall_frame_t;
 
-// File descriptor table (simple for now)
-#define MAX_FDS 16
-typedef struct {
-    bool in_use;
-    void* data;      // Pointer to file data in memory
-    size_t size;     // File size
-    size_t offset;   // Current read position
-    char name[64];   // File name
-    uint32_t owner_pid;  // ADD THIS
-} fd_entry_t;
-
-static fd_entry_t fd_table[MAX_FDS];
-
-// Initialize file descriptor table
-static void fd_table_init(void) {
-    for (int i = 0; i < MAX_FDS; i++) {
-        fd_table[i].in_use = false;
+static fd_entry_t* current_fd_table(void) {
+    process_t* proc = process_current();
+    if (!proc) {
+        return NULL;
     }
+
+    if (!proc->fds_initialized) {
+        for (size_t i = 0; i < PROCESS_MAX_FDS; i++) {
+            proc->fd_table[i].in_use = false;
+            proc->fd_table[i].data = NULL;
+            proc->fd_table[i].size = 0;
+            proc->fd_table[i].offset = 0;
+            proc->fd_table[i].flags = 0;
+            proc->fd_table[i].name[0] = '\0';
+        }
+        proc->fds_initialized = true;
+    }
+
+    return proc->fd_table;
 }
 
 // Close all file descriptors for a process
-static void fd_close_all_for_process(uint32_t pid) {
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (fd_table[i].in_use && fd_table[i].owner_pid == pid) {
-            fd_table[i].in_use = false;
-        }
+static void fd_close_all_for_process(process_t* proc) {
+    if (!proc || !proc->fds_initialized) {
+        return;
+    }
+
+    for (size_t i = 0; i < PROCESS_MAX_FDS; i++) {
+        proc->fd_table[i].in_use = false;
+        proc->fd_table[i].data = NULL;
+        proc->fd_table[i].size = 0;
+        proc->fd_table[i].offset = 0;
+        proc->fd_table[i].flags = 0;
+        proc->fd_table[i].name[0] = '\0';
     }
 }
 
-void syscall_on_process_exit(uint32_t pid) {
-    fd_close_all_for_process(pid);
+void syscall_on_process_exit(process_t* proc) {
+    fd_close_all_for_process(proc);
 }
 
 // Allocate a file descriptor
-static int fd_alloc(const char* name, void* data, size_t size) {
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (!fd_table[i].in_use) {
-            fd_table[i].in_use = true;
-            fd_table[i].data = data;
-            fd_table[i].size = size;
-            fd_table[i].offset = 0;
-            fd_table[i].owner_pid = process_current() ? process_current()->pid : 0;
-            
-            // Copy name
-            int j = 0;
-            while (name[j] && j < 63) {
-                fd_table[i].name[j] = name[j];
+static int fd_alloc(const char* name, void* data, size_t size, int flags) {
+    fd_entry_t* table = current_fd_table();
+    if (!table) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < PROCESS_MAX_FDS; i++) {
+        if (!table[i].in_use) {
+            table[i].in_use = true;
+            table[i].data = data;
+            table[i].size = size;
+            table[i].offset = 0;
+            table[i].flags = flags;
+
+            size_t j = 0;
+            while (name[j] && j < sizeof(table[i].name) - 1) {
+                table[i].name[j] = name[j];
                 j++;
             }
-            fd_table[i].name[j] = '\0';
-            
-            return i;
+            table[i].name[j] = '\0';
+
+            return (int)i;
         }
     }
     return -1; // No free FDs
@@ -817,5 +829,5 @@ void syscall_handler(void) {
 }
 
 void syscall_init(void) {
-    fd_table_init();
+    // Per-process resources are initialized as processes are created.
 }

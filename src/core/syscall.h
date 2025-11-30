@@ -72,6 +72,7 @@ static inline size_t sys_hda_write_pcm(const int16_t* samples, size_t frames) {
 }
 
 void syscall_init(void);
-void syscall_on_process_exit(uint32_t pid);
+struct process;
+void syscall_on_process_exit(struct process* proc);
 
 #endif // CORE_SYSCALL_H
