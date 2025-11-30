@@ -33,6 +33,12 @@ void timer_handler(uint64_t* interrupt_rsp) {
     if (tick_handler && (ticks % 5 == 0)) {
         tick_handler(interrupt_rsp);
     }
+
+    // Send End Of Interrupt (EOI) to the PIC so it can deliver the next
+    // timer interrupt. Without this, the PIC will mask further IRQ0 events
+    // after the first one, leaving processes stuck in the SLEEPING state
+    // because the scheduler never runs again.
+    outb(0x20, 0x20);
 }
 
 void timer_register_tick_handler(timer_tick_handler_t handler) {
