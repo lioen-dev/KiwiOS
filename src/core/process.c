@@ -5,12 +5,33 @@
 #include "memory/vmm.h"
 #include "drivers/timer.h"
 #include "lib/string.h"
+#include <stddef.h>
 
 process_t* process_list_head = NULL;
 static process_t* current_process = NULL;
 static uint32_t next_pid = 1;
 
 extern void switch_context(context_t* old_ctx, context_t* new_ctx);
+
+static void process_reset_fd_table(process_t* proc) {
+    if (!proc) return;
+    for (size_t i = 0; i < PROCESS_MAX_FDS; i++) {
+        proc->fd_table[i].in_use = false;
+        proc->fd_table[i].data = NULL;
+        proc->fd_table[i].size = 0;
+        proc->fd_table[i].offset = 0;
+        proc->fd_table[i].flags = 0;
+        proc->fd_table[i].name[0] = '\0';
+    }
+    proc->fds_initialized = true;
+}
+
+static void process_reset_cwd(process_t* proc) {
+    if (!proc) return;
+    proc->cwd[0] = '/';
+    proc->cwd[1] = '\0';
+    proc->cwd_initialized = true;
+}
 
 static bool process_phys_is_reserved(process_t* proc, uint64_t phys) {
     if (!proc || proc->fb_mapping_size == 0) {
@@ -42,8 +63,11 @@ void process_init(void) {
     idle->name[4] = '\0';
     idle->state = PROCESS_RUNNING;
     idle->next = NULL;
-    
+
     idle->start_ticks = timer_get_ticks();
+
+    process_reset_fd_table(idle);
+    process_reset_cwd(idle);
 
     process_list_head = idle;
     current_process = idle;
@@ -82,6 +106,9 @@ process_t* process_create(const char* name, void (*entry_point)(void)) {
     proc->pid = next_pid++;
     proc->state = PROCESS_READY;
     proc->start_ticks = timer_get_ticks();
+
+    process_reset_fd_table(proc);
+    process_reset_cwd(proc);
     
     if (name) {
         size_t len = strlen(name);
@@ -212,8 +239,8 @@ void process_free_page_table(page_table_t* pt) {
 
 void process_destroy(process_t* proc) {
     if (!proc) return;
-    extern void syscall_on_process_exit(uint32_t pid);
-    syscall_on_process_exit(proc->pid);
+    extern void syscall_on_process_exit(process_t* proc_ref);
+    syscall_on_process_exit(proc);
     
     // Free kernel stack
     if (proc->stack_top) {

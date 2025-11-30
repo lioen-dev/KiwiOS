@@ -24,11 +24,22 @@ typedef struct {
 } context_t;
 
 // Full interrupt context (for timer-based preemption)
-typedef struct {
+typedef struct { 
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t rip, cs, rflags, rsp, ss;
 } interrupt_context_t;
+
+#define PROCESS_MAX_FDS 32
+
+typedef struct {
+    bool in_use;
+    void* data;
+    size_t size;
+    size_t offset;
+    int flags;
+    char name[64];
+} fd_entry_t;
 
 typedef struct process {
     uint32_t pid;
@@ -53,6 +64,12 @@ typedef struct process {
     uint64_t fb_mapping_virt_base;
 
     uint64_t start_ticks;                  // Ticks at process start (for timing)
+
+    fd_entry_t fd_table[PROCESS_MAX_FDS];  // Per-process file descriptors
+    bool fds_initialized;
+
+    char cwd[512];                         // Per-process working directory
+    bool cwd_initialized;
 
     struct process* next;
 } process_t;
