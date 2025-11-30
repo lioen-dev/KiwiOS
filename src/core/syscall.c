@@ -111,6 +111,21 @@ static void save_interrupt_context_from_frame(process_t* proc, syscall_frame_t* 
     proc->interrupt_context.ss  = frame->ss;
 }
 
+// Convert milliseconds to timer ticks using 64-bit arithmetic; returns false on overflow
+static bool ms_to_ticks(uint64_t ms, uint64_t freq, uint64_t* out_ticks) {
+    if (!out_ticks || freq == 0) {
+        return false;
+    }
+
+    if (ms != 0 && ms > UINT64_MAX / freq) {
+        return false;
+    }
+
+    uint64_t product = ms * freq;
+    *out_ticks = product / 1000;
+    return true;
+}
+
 static bool switch_to_next_process(syscall_frame_t* frame, process_t* current) {
     process_cleanup_terminated();
 
@@ -345,15 +360,15 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             uint64_t ms = arg1;
             uint64_t freq = timer_get_frequency();
             process_t* current = process_current();
+            uint64_t ticks = 0;
 
-            if (freq == 0 || !current) {
+            if (!current || !ms_to_ticks(ms, freq, &ticks)) {
                 set_errno(current, K_EINVAL);
                 retval = (uint64_t)-1;
                 break;
             }
 
-            __uint128_t ticks = ((__uint128_t)ms * freq) / 1000;
-            uint64_t target = timer_get_ticks() + (uint64_t)ticks;
+            uint64_t target = timer_get_ticks() + ticks;
 
             if (request_sleep_until(frame, target)) {
                 return;
@@ -876,15 +891,15 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             uint64_t ms = arg1;
             uint64_t freq = timer_get_frequency();
             process_t* current = process_current();
+            uint64_t ticks = 0;
 
-            if (freq == 0 || !current) {
+            if (!current || !ms_to_ticks(ms, freq, &ticks)) {
                 set_errno(current, K_EINVAL);
                 retval = (uint64_t)-1;
                 break;
             }
 
-            __uint128_t ticks = ((__uint128_t)ms * freq) / 1000;
-            uint64_t target = timer_get_ticks() + (uint64_t)ticks;
+            uint64_t target = timer_get_ticks() + ticks;
 
             if (request_sleep_until(frame, target)) {
                 return;
