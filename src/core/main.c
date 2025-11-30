@@ -1153,7 +1153,8 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  pwd             - Print working directory\n");
     print(fb, "  cd [path]      - Change directory (default: /)\n");
     print(fb, "  cat <file>     - Display file contents\n");
-    print(fb, "  run <file>     - Execute a program\n");
+    print(fb, "  run <file> [args...] [&] - Execute a program (append & for background)\n");
+    print(fb, "  Executables can also be run directly: ./file [args...] [&]\n");
     print(fb, "  touch <file>   - Create an empty file\n");
     print(fb, "  append <file> <text> - Append text to a file\n");
     print(fb, "  truncate <file> <size> - Truncate file to size bytes\n");
@@ -1959,6 +1960,8 @@ void cmd_ls(struct limine_framebuffer* fb, const char* path) {
     ext2_listdir(g_fs, p, _ls_cb, NULL);
 }
 
+#define INPUT_BUFFER_SIZE 256
+
 void cmd_pwd(struct limine_framebuffer* fb) {
     (void)fb;
     if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
@@ -2014,36 +2017,104 @@ void cmd_truncate(struct limine_framebuffer* fb, const char* path, size_t new_si
     if (!ext2_truncate(g_fs, path, (uint32_t)new_size)) kputs("truncate: failed\n");
 }
 
-void cmd_run(struct limine_framebuffer* fb, const char* args) {
+#define MAX_RUN_ARGS 32
+
+static bool build_argv(const char* program, const char* argstr, char* buffer,
+                       size_t buffer_sz, const char** argv_out, int* argc_out,
+                       bool* background) {
+    if (!program || !*program) return false;
+
+    size_t prog_len = strlen(program);
+    size_t arg_len = (argstr && *argstr) ? strlen(argstr) : 0;
+
+    if (prog_len + (arg_len ? 1 : 0) + arg_len + 1 > buffer_sz) {
+        kputs("run: argument list too long\n");
+        return false;
+    }
+
+    size_t pos = 0;
+    for (; pos < prog_len; pos++) buffer[pos] = program[pos];
+    if (arg_len) buffer[pos++] = ' ';
+    for (size_t i = 0; i < arg_len; i++) buffer[pos++] = argstr[i];
+    buffer[pos] = '\0';
+
+    while (pos > 0 && buffer[pos - 1] == ' ') pos--;
+    buffer[pos] = '\0';
+
+    *background = false;
+    if (pos > 0 && buffer[pos - 1] == '&') {
+        *background = true;
+        while (pos > 0 && (buffer[pos - 1] == '&' || buffer[pos - 1] == ' ')) pos--;
+        buffer[pos] = '\0';
+    }
+
+    char* p = buffer;
+    int argc = 0;
+    while (*p && argc < MAX_RUN_ARGS) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        argv_out[argc++] = p;
+        while (*p && *p != ' ') p++;
+        if (*p) { *p++ = '\0'; }
+    }
+
+    if (*p) {
+        kputs("run: too many arguments\n");
+        return false;
+    }
+
+    *argc_out = argc;
+    return argc > 0;
+}
+
+static bool launch_program(struct limine_framebuffer* fb, const char* program,
+                           const char* argstr) {
     (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!args || !*args) { kputs("usage: run <file.elf> [args...]\n"); return; }
+    if (!g_fs) { kputs("[ext2] not mounted.\n"); return true; }
+    if (!program || !*program) { kputs("usage: run <file.elf> [args...]\n"); return true; }
 
-    const char* p = args;
-    char prog[256]; size_t n=0;
-    while (*p && *p!=' ' && n < sizeof(prog)-1) { prog[n++]=*p++; }
-    prog[n]='\0';
+    char argbuf[INPUT_BUFFER_SIZE];
+    const char* argv_arr[MAX_RUN_ARGS];
+    int argc = 0;
+    bool background = false;
 
-    int argc = 0; const char* argv_arr[8];
-    argv_arr[argc++] = prog;
-    while (*p==' ') p++;
-    while (*p && argc < 8) {
-        argv_arr[argc++] = p;
-        while (*p && *p!=' ') p++;
-        if (*p==' ') { *((char*)p) = '\0'; p++; while (*p==' ') p++; }
+    if (!build_argv(program, argstr, argbuf, sizeof(argbuf), argv_arr, &argc, &background)) {
+        return true;
     }
 
     size_t fsz = 0;
-    void* data = ext2_read_entire_file(g_fs, prog, &fsz);
-    if (!data) { kputs("run: cannot read file\n"); return; }
-    if (!elf_validate(data)) { kputs("run: not a valid ELF64\n"); extern void kfree(void*); kfree(data); return; }
+    void* data = ext2_read_entire_file(g_fs, argv_arr[0], &fsz);
+    if (!data) { kputs("run: cannot read file\n"); return true; }
+    if (!elf_validate(data)) { kputs("run: not a valid ELF64\n"); extern void kfree(void*); kfree(data); return true; }
 
-    process_t* proc = elf_load_with_args(prog, data, fsz, argc, argv_arr);
+    process_t* proc = elf_load_with_args(argv_arr[0], data, fsz, argc, argv_arr);
     extern void kfree(void*);
     kfree(data);
-    if (!proc) { kputs("run: load failed\n"); return; }
-    kputs("started process: "); kputs(proc->name); kputs("\n");
-    process_switch_to(proc);
+    if (!proc) { kputs("run: load failed\n"); return true; }
+
+    kputs("started process: "); kputs(proc->name);
+    if (background) kputs(" (background)");
+    kputs("\n");
+
+    if (!background) {
+        process_switch_to(proc);
+    }
+
+    return true;
+}
+
+void cmd_run(struct limine_framebuffer* fb, const char* args) {
+    (void)fb;
+    if (!args || !*args) { kputs("usage: run <file.elf> [args...]\n"); return; }
+
+    const char* p = args;
+    while (*p == ' ') p++;
+    if (!*p) { kputs("usage: run <file.elf> [args...]\n"); return; }
+
+    const char* prog = p;
+    while (*p && *p != ' ') p++;
+    const char* rest = (*p) ? p + 1 : NULL;
+    launch_program(fb, prog, rest);
 }
 
 static void print_prompt(void) {
@@ -2173,24 +2244,25 @@ void execute_command(struct limine_framebuffer *fb, char *input) {
         return;
     }
 
-    
+
 
     if (strcmp(input, "scale") == 0) { cmd_scale(fb, args); return; }
 
-        // Look up command in table
-        for (int i = 0; commands[i].name != NULL; i++) {
-            if (strcmp(input, commands[i].name) == 0) {
-                commands[i].func(fb);
-                return;
-            }
+    // Look up command in table
+    for (int i = 0; commands[i].name != NULL; i++) {
+        if (strcmp(input, commands[i].name) == 0) {
+            commands[i].func(fb);
+            return;
         }
-        
-        // Command not found
-        cmd_unknown(fb, input);
     }
 
+    if (launch_program(fb, input, args)) { return; }
+
+    // Command not found
+    cmd_unknown(fb, input);
+}
+
 // ================= Input handling =================
-#define INPUT_BUFFER_SIZE 256
 
 #define HISTORY_SIZE 32
 static char history[HISTORY_SIZE][INPUT_BUFFER_SIZE];
