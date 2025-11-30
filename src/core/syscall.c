@@ -30,15 +30,6 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-// Safe copy from kernel to user space
-static void copy_to_user(void* dest, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dest;
-    const uint8_t* s = (const uint8_t*)src;
-    for (size_t i = 0; i < n; i++) {
-        d[i] = s[i];
-    }
-}
-
 // Validate that a pointer is in userspace range
 static bool is_userspace_ptr(uint64_t ptr, size_t len) {
     uint64_t hhdm = hhdm_get_offset();
@@ -82,27 +73,6 @@ typedef struct {
     uint64_t rip, cs, rflags, rsp, ss;
 } syscall_frame_t;
 
-static fd_entry_t* current_fd_table(void) {
-    process_t* proc = process_current();
-    if (!proc) {
-        return NULL;
-    }
-
-    if (!proc->fds_initialized) {
-        for (size_t i = 0; i < PROCESS_MAX_FDS; i++) {
-            proc->fd_table[i].in_use = false;
-            proc->fd_table[i].data = NULL;
-            proc->fd_table[i].size = 0;
-            proc->fd_table[i].offset = 0;
-            proc->fd_table[i].flags = 0;
-            proc->fd_table[i].name[0] = '\0';
-        }
-        proc->fds_initialized = true;
-    }
-
-    return proc->fd_table;
-}
-
 // Close all file descriptors for a process
 static void fd_close_all_for_process(process_t* proc) {
     if (!proc || !proc->fds_initialized) {
@@ -121,34 +91,6 @@ static void fd_close_all_for_process(process_t* proc) {
 
 void syscall_on_process_exit(process_t* proc) {
     fd_close_all_for_process(proc);
-}
-
-// Allocate a file descriptor
-static int fd_alloc(const char* name, void* data, size_t size, int flags) {
-    fd_entry_t* table = current_fd_table();
-    if (!table) {
-        return -1;
-    }
-
-    for (size_t i = 0; i < PROCESS_MAX_FDS; i++) {
-        if (!table[i].in_use) {
-            table[i].in_use = true;
-            table[i].data = data;
-            table[i].size = size;
-            table[i].offset = 0;
-            table[i].flags = flags;
-
-            size_t j = 0;
-            while (name[j] && j < sizeof(table[i].name) - 1) {
-                table[i].name[j] = name[j];
-                j++;
-            }
-            table[i].name[j] = '\0';
-
-            return (int)i;
-        }
-    }
-    return -1; // No free FDs
 }
 
 // Syscall handler implementation
@@ -582,7 +524,7 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             
             if (current) {
                 // Close all file descriptors for this process
-                fd_close_all_for_process(current->pid);
+                fd_close_all_for_process(current);
                 
                 current->state = PROCESS_TERMINATED;
                 print(fb, "\nProcess ");

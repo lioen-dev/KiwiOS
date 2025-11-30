@@ -689,11 +689,20 @@ __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     asm volatile("mov %%cr2, %0" : "=r"(cr2));
 
     uint32_t old_fg = fg_color, old_bg = bg_color;
+
+    // Reset scrollback first (it restores DEFAULT colors), then set
+    // the panic colors so they are used for clearing and rendering.
+    reset_scrollback();
     fg_color = 0x00FFFFFF;
-    bg_color = 0x00FF0000;
+    bg_color = 0x00913030;
+
+    // Ensure the scrollback buffer's visible lines use the panic bg
+    // (reset_scrollback wrote DEFAULT_BG into the cells). Clear each
+    // visible logical line so `render_visible` won't draw the old
+    // default background over our red clear.
+    for (uint32_t i = 0; i < g_rows; i++) clear_line(i);
 
     clear_outputs();
-    reset_scrollback();
     render_visible();
 
     print(fb, "\n  :3 uh oh, KERNEL PANIC!\n");
