@@ -9,6 +9,7 @@
 typedef enum {
     PROCESS_READY,
     PROCESS_RUNNING,
+    PROCESS_SLEEPING,
     PROCESS_TERMINATED
 } process_state_t;
 
@@ -64,6 +65,11 @@ typedef struct process {
     uint64_t fb_mapping_virt_base;
 
     uint64_t start_ticks;                  // Ticks at process start (for timing)
+
+    uint64_t sleep_until;                  // Target tick to wake from sleep
+    bool sleep_interrupted;                // True if a sleep was cut short
+
+    int last_errno;                        // errno-like value for syscalls
 
     fd_entry_t fd_table[PROCESS_MAX_FDS];  // Per-process file descriptors
     bool fds_initialized;
