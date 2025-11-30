@@ -46,9 +46,9 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
 
     process_t* next = current->next;
     if (!next) next = process_get_list();
+    process_t* start = next;
 
-    int checked = 0;
-    while (next && checked < 10) {
+    while (next) {
         if (next != current && next->state == PROCESS_READY && next->pid != 0) {
             if (!next->has_been_interrupted) {
                 current->interrupt_context.r15 = interrupt_rsp[0];
@@ -155,7 +155,7 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
 
         next = next->next;
         if (!next) next = process_get_list();
-        checked++;
+        if (next == start) break;
     }
 
     in_scheduler = false;
