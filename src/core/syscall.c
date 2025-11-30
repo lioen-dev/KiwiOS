@@ -16,6 +16,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#define K_EINVAL 22
+#define K_EFAULT 14
+#define K_ENOMEM 12
+#define K_EBADF   9
+
 extern struct limine_framebuffer* fb0(void);
 extern void print(struct limine_framebuffer* fb, const char* s);
 extern void print_hex(struct limine_framebuffer* fb, uint64_t num);
@@ -72,6 +77,228 @@ typedef struct {
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t rip, cs, rflags, rsp, ss;
 } syscall_frame_t;
+
+static void set_errno(process_t* proc, int err) {
+    if (proc) {
+        proc->last_errno = err;
+    }
+}
+
+static void save_interrupt_context_from_frame(process_t* proc, syscall_frame_t* frame) {
+    if (!proc || !frame) {
+        return;
+    }
+
+    proc->interrupt_context.r15 = frame->r15;
+    proc->interrupt_context.r14 = frame->r14;
+    proc->interrupt_context.r13 = frame->r13;
+    proc->interrupt_context.r12 = frame->r12;
+    proc->interrupt_context.r11 = frame->r11;
+    proc->interrupt_context.r10 = frame->r10;
+    proc->interrupt_context.r9  = frame->r9;
+    proc->interrupt_context.r8  = frame->r8;
+    proc->interrupt_context.rbp = frame->rbp;
+    proc->interrupt_context.rdi = frame->rdi;
+    proc->interrupt_context.rsi = frame->rsi;
+    proc->interrupt_context.rdx = frame->rdx;
+    proc->interrupt_context.rcx = frame->rcx;
+    proc->interrupt_context.rbx = frame->rbx;
+    proc->interrupt_context.rax = frame->rax;
+    proc->interrupt_context.rip = frame->rip;
+    proc->interrupt_context.cs  = frame->cs;
+    proc->interrupt_context.rflags = frame->rflags;
+    proc->interrupt_context.rsp = frame->rsp;
+    proc->interrupt_context.ss  = frame->ss;
+}
+
+// Convert milliseconds to timer ticks using 64-bit arithmetic; returns false on overflow
+static bool ms_to_ticks(uint64_t ms, uint64_t freq, uint64_t* out_ticks) {
+    if (!out_ticks || freq == 0) {
+        return false;
+    }
+
+    if (ms != 0 && ms > UINT64_MAX / freq) {
+        return false;
+    }
+
+    uint64_t product = ms * freq;
+    *out_ticks = product / 1000;
+    return true;
+}
+
+static bool switch_to_next_process(syscall_frame_t* frame, process_t* current) {
+    process_cleanup_terminated();
+
+    process_t* next = process_get_list();
+    while (next) {
+        if (next != current && next->state == PROCESS_READY && next->pid != 0) {
+            if (next->has_been_interrupted) {
+                frame->r15 = next->interrupt_context.r15;
+                frame->r14 = next->interrupt_context.r14;
+                frame->r13 = next->interrupt_context.r13;
+                frame->r12 = next->interrupt_context.r12;
+                frame->r11 = next->interrupt_context.r11;
+                frame->r10 = next->interrupt_context.r10;
+                frame->r9  = next->interrupt_context.r9;
+                frame->r8  = next->interrupt_context.r8;
+                frame->rbp = next->interrupt_context.rbp;
+                frame->rdi = next->interrupt_context.rdi;
+                frame->rsi = next->interrupt_context.rsi;
+                frame->rdx = next->interrupt_context.rdx;
+                frame->rcx = next->interrupt_context.rcx;
+                frame->rbx = next->interrupt_context.rbx;
+                frame->rax = next->interrupt_context.rax;
+                frame->rip = next->interrupt_context.rip;
+                frame->cs  = next->interrupt_context.cs;
+                frame->rflags = next->interrupt_context.rflags;
+                frame->rsp = next->interrupt_context.rsp;
+                frame->ss  = next->interrupt_context.ss;
+            } else {
+                frame->r15 = 0;
+                frame->r14 = 0;
+                frame->r13 = 0;
+                frame->r12 = 0;
+                frame->r11 = 0;
+                frame->r10 = 0;
+                frame->r9  = 0;
+                frame->r8  = 0;
+                frame->rbp = 0;
+                frame->rdi = 0;
+                frame->rsi = 0;
+                frame->rdx = 0;
+                frame->rcx = 0;
+                frame->rbx = 0;
+                frame->rax = 0;
+                frame->rip = next->interrupt_context.rip;
+                frame->cs  = next->interrupt_context.cs;
+                frame->rflags = next->interrupt_context.rflags;
+                frame->rsp = next->interrupt_context.rsp;
+                frame->ss  = next->interrupt_context.ss;
+                next->has_been_interrupted = true;
+            }
+
+            next->state = PROCESS_RUNNING;
+            tss_set_kernel_stack(next->stack_top);
+
+            if (next->page_table) {
+                extern void vmm_switch_page_table(page_table_t* pt);
+                vmm_switch_page_table(next->page_table);
+            }
+
+            extern void process_set_current(process_t* proc);
+            process_set_current(next);
+            return true;
+        }
+        next = next->next;
+    }
+
+    // No ready user processes, fall back to idle if possible
+    next = process_get_list();
+    while (next) {
+        if (next->pid == 0) {
+            break;
+        }
+        next = next->next;
+    }
+
+    if (next && next->context.rsp != 0) {
+        uint64_t* saved_stack = (uint64_t*)next->context.rsp;
+        uint64_t return_addr = saved_stack[0];
+
+        frame->rip = return_addr;
+        frame->cs  = 0x08;
+        frame->ss  = 0x10;
+        frame->rflags = next->context.rflags;
+        frame->rsp = next->context.rsp + 8;
+
+        frame->rbp = next->context.rbp;
+        frame->rbx = next->context.rbx;
+        frame->r12 = next->context.r12;
+        frame->r13 = next->context.r13;
+        frame->r14 = next->context.r14;
+        frame->r15 = next->context.r15;
+
+        frame->rax = 0;
+        frame->rcx = 0;
+        frame->rdx = 0;
+        frame->rsi = 0;
+        frame->rdi = 0;
+        frame->r8  = 0;
+        frame->r9  = 0;
+        frame->r10 = 0;
+        frame->r11 = 0;
+
+        vmm_switch_page_table(vmm_get_kernel_page_table());
+        tss_set_kernel_stack(next->stack_top);
+
+        extern void process_set_current(process_t* proc);
+        process_set_current(next);
+        return true;
+    }
+
+    return false;
+}
+
+static bool request_sleep_until(syscall_frame_t* frame, uint64_t target_tick) {
+    process_t* current = process_current();
+    if (!current) {
+        return false;
+    }
+
+    current->sleep_until = target_tick;
+    current->state = PROCESS_SLEEPING;
+    current->sleep_interrupted = false;
+
+    save_interrupt_context_from_frame(current, frame);
+    current->interrupt_context.rax = 0;
+    current->has_been_interrupted = true;
+
+    if (switch_to_next_process(frame, current)) {
+        return true;
+    }
+
+    // If no other process could be scheduled, put the current one back
+    current->state = PROCESS_RUNNING;
+    return false;
+}
+
+static bool range_is_free(process_t* proc, uint64_t base, uint64_t pages) {
+    if (!proc || !proc->page_table) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t va = base + (i * PAGE_SIZE);
+        if (vmm_get_physical(proc->page_table, va) != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static uint64_t find_free_range(process_t* proc, uint64_t start, uint64_t pages) {
+    if (!proc || !proc->page_table) {
+        return 0;
+    }
+
+    uint64_t limit = 0x800000000000ULL;
+    uint64_t length = pages * PAGE_SIZE;
+    uint64_t cursor = start;
+
+    if (length == 0 || cursor >= limit) {
+        return 0;
+    }
+
+    while (cursor + length <= limit) {
+        if (range_is_free(proc, cursor, pages)) {
+            return cursor;
+        }
+        cursor += PAGE_SIZE;
+    }
+
+    return 0;
+}
 
 // Close all file descriptors for a process
 static void fd_close_all_for_process(process_t* proc) {
@@ -131,12 +358,20 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
         case SYS_SLEEP: {
             uint64_t ms = arg1;
-            uint64_t start = timer_get_ticks();
             uint64_t freq = timer_get_frequency();
-            uint64_t target = start + (ms * freq) / 1000;
+            process_t* current = process_current();
+            uint64_t ticks = 0;
 
-            while (timer_get_ticks() < target) {
-                asm volatile ("sti; hlt");
+            if (!current || !ms_to_ticks(ms, freq, &ticks)) {
+                set_errno(current, K_EINVAL);
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            uint64_t target = timer_get_ticks() + ticks;
+
+            if (request_sleep_until(frame, target)) {
+                return;
             }
 
             retval = 0;
@@ -313,32 +548,34 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
         case SYS_BRK: {
             // arg1 = new heap end address (or 0 to query current)
             // Returns: current/new heap end address
-            
+
             process_t* proc = process_current();
             if (!proc) {
                 retval = (uint64_t)-1;
                 break;
             }
-            
+
             // If arg1 is 0, just return current heap end
             if (arg1 == 0) {
                 retval = proc->heap_end;
                 break;
             }
-            
+
             uint64_t new_end = arg1;
-            
+
             // Validate new end is in userspace and above heap start
             uint64_t hhdm = hhdm_get_offset();
             if (new_end >= hhdm || new_end < proc->heap_start) {
-                retval = proc->heap_end;  // Return old value on error
+                set_errno(proc, K_EINVAL);
+                retval = (uint64_t)-1;
                 break;
             }
-            
+
             // Don't allow heap to grow past user stack (leave some space)
             uint64_t max_heap = 0x500000000000ULL;  // 5TB mark (well below 8TB stack)
             if (new_end > max_heap) {
-                retval = proc->heap_end;
+                set_errno(proc, K_ENOMEM);
+                retval = (uint64_t)-1;
                 break;
             }
             
@@ -386,18 +623,19 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                         }
                     }
 
-                    retval = proc->heap_end;
+                    set_errno(proc, K_ENOMEM);
+                    retval = (uint64_t)-1;
                     break;
                 }
 
                 // Update heap end
                 proc->heap_end = new_end;
-                retval = new_end;
+                retval = 0;
 
             } else if (new_end_page < old_end_page) {
                 // Shrinking heap - unmap pages
                 uint64_t pages_to_free = (old_end_page - new_end_page) / PAGE_SIZE;
-                
+
                 for (uint64_t i = 0; i < pages_to_free; i++) {
                     uint64_t virt_addr = new_end_page + (i * PAGE_SIZE);
                     uint64_t phys_addr = vmm_get_physical(proc->page_table, virt_addr);
@@ -407,41 +645,118 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                         pmm_free((void*)phys_addr);
                     }
                 }
-                
+
                 proc->heap_end = new_end;
-                retval = new_end;
-                
+                retval = 0;
+
             } else {
                 // No page boundary crossed, just update pointer
                 proc->heap_end = new_end;
-                retval = new_end;
+                retval = 0;
             }
-            
+
             break;
         }
 
         case SYS_MMAP: {
             process_t* proc = process_current();
-            uint64_t length = arg2;
             uint64_t virt_addr = arg1;
+            uint64_t length = arg2;
+            uint64_t prot = arg3;
+            uint64_t flags = frame->rsi;
+            int fd = (int)frame->rdi;
+            uint64_t offset = frame->r8;
 
             if (!proc || !proc->page_table || length == 0) {
+                set_errno(proc, K_EINVAL);
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            bool want_shared = (flags & MAP_SHARED) != 0;
+            bool want_private = (flags & MAP_PRIVATE) != 0;
+            bool map_fixed = (flags & MAP_FIXED) != 0;
+            bool anonymous = (flags & MAP_ANONYMOUS) != 0;
+
+            if (want_shared == want_private) {
+                set_errno(proc, K_EINVAL);
                 retval = (uint64_t)-1;
                 break;
             }
 
             uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+            uint64_t aligned_length = pages * PAGE_SIZE;
 
-            if (virt_addr == 0) {
-                virt_addr = PAGE_ALIGN_UP(proc->heap_end);
-                if (virt_addr < 0x40000000000ULL) {
-                    virt_addr = 0x40000000000ULL; // 4TB default mmap base
+            if (map_fixed) {
+                if (virt_addr == 0 || (virt_addr & (PAGE_SIZE - 1))) {
+                    set_errno(proc, K_EINVAL);
+                    retval = (uint64_t)-1;
+                    break;
                 }
             }
 
-            if (!is_userspace_ptr(virt_addr, length)) {
+            if (virt_addr != 0) {
+                virt_addr &= ~(PAGE_SIZE - 1);
+            }
+
+            uint64_t search_base = PAGE_ALIGN_UP(proc->heap_end);
+            if (search_base < 0x40000000000ULL) {
+                search_base = 0x40000000000ULL;
+            }
+
+            if (!map_fixed) {
+                if (virt_addr && !range_is_free(proc, virt_addr, pages)) {
+                    virt_addr = find_free_range(proc, virt_addr + PAGE_SIZE, pages);
+                }
+
+                if (virt_addr == 0 || !range_is_free(proc, virt_addr, pages)) {
+                    virt_addr = find_free_range(proc, search_base, pages);
+                }
+
+                if (virt_addr == 0) {
+                    set_errno(proc, K_ENOMEM);
+                    retval = (uint64_t)-1;
+                    break;
+                }
+            } else {
+                if (!range_is_free(proc, virt_addr, pages)) {
+                    set_errno(proc, K_EINVAL);
+                    retval = (uint64_t)-1;
+                    break;
+                }
+            }
+
+            if (!is_userspace_ptr(virt_addr, aligned_length)) {
+                set_errno(proc, K_EFAULT);
                 retval = (uint64_t)-1;
                 break;
+            }
+
+            const uint8_t* file_bytes = NULL;
+            size_t file_size = 0;
+
+            if (!anonymous) {
+                if (fd < 0 || (size_t)fd >= PROCESS_MAX_FDS || !proc->fd_table[fd].in_use) {
+                    set_errno(proc, K_EBADF);
+                    retval = (uint64_t)-1;
+                    break;
+                }
+
+                fd_entry_t* entry = &proc->fd_table[fd];
+
+                if (offset > entry->size) {
+                    set_errno(proc, K_EINVAL);
+                    retval = (uint64_t)-1;
+                    break;
+                }
+
+                file_bytes = (const uint8_t*)entry->data;
+                file_size = entry->size;
+            }
+
+            uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
+            if (prot & PROT_WRITE) {
+                page_flags |= PAGE_WRITE;
             }
 
             bool ok = true;
@@ -451,17 +766,36 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                 uint64_t va = virt_addr + (i * PAGE_SIZE);
                 void* phys = pmm_alloc();
 
-                if (!phys) { ok = false; break; }
+                if (!phys) {
+                    set_errno(proc, K_ENOMEM);
+                    ok = false;
+                    break;
+                }
 
-                if (!vmm_map_page(proc->page_table, va, (uint64_t)phys,
-                                  PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
+                if (!vmm_map_page(proc->page_table, va, (uint64_t)phys, page_flags)) {
                     pmm_free(phys);
+                    set_errno(proc, K_ENOMEM);
                     ok = false;
                     break;
                 }
 
                 uint8_t* pv = (uint8_t*)phys_to_virt((uint64_t)phys);
-                memset(pv, 0, PAGE_SIZE);
+                size_t copied = 0;
+
+                if (!anonymous && file_bytes) {
+                    size_t page_offset = i * PAGE_SIZE;
+
+                    if (offset + page_offset < file_size) {
+                        size_t remaining = file_size - (offset + page_offset);
+                        copied = remaining > PAGE_SIZE ? PAGE_SIZE : remaining;
+                        memcpy(pv, file_bytes + offset + page_offset, copied);
+                    }
+                }
+
+                if (copied < PAGE_SIZE) {
+                    memset(pv + copied, 0, PAGE_SIZE - copied);
+                }
+
                 mapped++;
             }
 
@@ -474,7 +808,9 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                         pmm_free((void*)phys);
                     }
                 }
+
                 retval = (uint64_t)-1;
+
             } else {
                 retval = virt_addr;
             }
@@ -533,122 +869,16 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
                 print_hex(fb, arg1);
                 print(fb, "\n");
             }
-            
+
             process_cleanup_terminated();
-            
-            // Find another ready process
-            process_t* next = process_get_list();
-            while (next) {
-                if (next != current && next->state == PROCESS_READY && next->pid != 0) {
-                    // Found a ready process
-                    if (next->has_been_interrupted) {
-                        frame->r15 = next->interrupt_context.r15;
-                        frame->r14 = next->interrupt_context.r14;
-                        frame->r13 = next->interrupt_context.r13;
-                        frame->r12 = next->interrupt_context.r12;
-                        frame->r11 = next->interrupt_context.r11;
-                        frame->r10 = next->interrupt_context.r10;
-                        frame->r9  = next->interrupt_context.r9;
-                        frame->r8  = next->interrupt_context.r8;
-                        frame->rbp = next->interrupt_context.rbp;
-                        frame->rdi = next->interrupt_context.rdi;
-                        frame->rsi = next->interrupt_context.rsi;
-                        frame->rdx = next->interrupt_context.rdx;
-                        frame->rcx = next->interrupt_context.rcx;
-                        frame->rbx = next->interrupt_context.rbx;
-                        frame->rax = next->interrupt_context.rax;
-                        frame->rip = next->interrupt_context.rip;
-                        frame->cs  = next->interrupt_context.cs;
-                        frame->rflags = next->interrupt_context.rflags;
-                        frame->rsp = next->interrupt_context.rsp;
-                        frame->ss  = next->interrupt_context.ss;
-                    } else {
-                        frame->r15 = 0;
-                        frame->r14 = 0;
-                        frame->r13 = 0;
-                        frame->r12 = 0;
-                        frame->r11 = 0;
-                        frame->r10 = 0;
-                        frame->r9  = 0;
-                        frame->r8  = 0;
-                        frame->rbp = 0;
-                        frame->rdi = 0;
-                        frame->rsi = 0;
-                        frame->rdx = 0;
-                        frame->rcx = 0;
-                        frame->rbx = 0;
-                        frame->rax = 0;
-                        frame->rip = next->interrupt_context.rip;
-                        frame->cs  = next->interrupt_context.cs;
-                        frame->rflags = next->interrupt_context.rflags;
-                        frame->rsp = next->interrupt_context.rsp;
-                        frame->ss  = next->interrupt_context.ss;
-                        next->has_been_interrupted = true;
-                    }
-                    
-                    next->state = PROCESS_RUNNING;
-                    tss_set_kernel_stack(next->stack_top);
-                    
-                    if (next->page_table) {
-                        extern void vmm_switch_page_table(page_table_t* pt);
-                        vmm_switch_page_table(next->page_table);
-                    }
-                    
-                    extern void process_set_current(process_t* proc);
-                    process_set_current(next);
-                    return;
-                }
-                next = next->next;
-            }
-            
-            // No other usermode processes
-            print(fb, "All processes finished\n");
-            
-            next = process_get_list();
-            while (next) {
-                if (next->pid == 0) {
-                    break;
-                }
-                next = next->next;
-            }
-            
-            if (next && next->context.rsp != 0) {
-                uint64_t* saved_stack = (uint64_t*)next->context.rsp;
-                uint64_t return_addr = saved_stack[0];
-                
-                // **Make the iret frame to return to ring0 idle/shell**
-                frame->rip = return_addr;
-                frame->cs  = 0x08;
-                frame->ss  = 0x10;
-                frame->rflags = next->context.rflags;
-                frame->rsp = next->context.rsp + 8;
-                
-                frame->rbp = next->context.rbp;
-                frame->rbx = next->context.rbx;
-                frame->r12 = next->context.r12;
-                frame->r13 = next->context.r13;
-                frame->r14 = next->context.r14;
-                frame->r15 = next->context.r15;
-                
-                frame->rax = 0;
-                frame->rcx = 0;
-                frame->rdx = 0;
-                frame->rsi = 0;
-                frame->rdi = 0;
-                frame->r8  = 0;
-                frame->r9  = 0;
-                frame->r10 = 0;
-                frame->r11 = 0;
 
-                // <<< added: be sure we're not still on the dead user's CR3
-                vmm_switch_page_table(vmm_get_kernel_page_table());
-                // <<< added (optional but nice): ensure correct kernel stack in TSS
-                tss_set_kernel_stack(next->stack_top);
-
-                process_set_current(next);
+            if (switch_to_next_process(frame, current)) {
                 return;
             }
-            
+
+            // No other usermode processes
+            print(fb, "All processes finished\n");
+
             break;
         }
 
@@ -659,29 +889,44 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
         case SYS_SLEEP_MS: {
             uint64_t ms = arg1;
-            uint64_t start = timer_get_ticks();
             uint64_t freq = timer_get_frequency();
-            uint64_t target = start + (ms * freq) / 1000;
-            while (timer_get_ticks() < target) {
-                // Enable interrupts and halt
-                // The timer interrupt will wake us up
-                asm volatile ("sti; hlt");
+            process_t* current = process_current();
+            uint64_t ticks = 0;
+
+            if (!current || !ms_to_ticks(ms, freq, &ticks)) {
+                set_errno(current, K_EINVAL);
+                retval = (uint64_t)-1;
+                break;
             }
+
+            uint64_t target = timer_get_ticks() + ticks;
+
+            if (request_sleep_until(frame, target)) {
+                return;
+            }
+
             retval = 0;
             break;
         }
 
         case SYS_SLEEP_TICKS: {
             uint64_t ticks = arg1;
-            uint64_t start = timer_get_ticks();
-            uint64_t target = start + ticks;
-            while (timer_get_ticks() < target) {
-                // Enable interrupts and halt
-                asm volatile ("sti; hlt");
+            process_t* current = process_current();
+
+            if (!current) {
+                retval = (uint64_t)-1;
+                break;
             }
+
+            uint64_t target = timer_get_ticks() + ticks;
+
+            if (request_sleep_until(frame, target)) {
+                return;
+            }
+
             retval = 0;
             break;
-        }  
+        }
 
         case SYS_GETTICKS_DELTA: {
             process_t* current = process_current();
