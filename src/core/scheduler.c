@@ -44,6 +44,16 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         }
     }
 
+    // Wake sleeping processes whose deadlines have passed
+    uint64_t now = timer_get_ticks();
+    process_t* wake = process_get_list();
+    while (wake) {
+        if (wake->state == PROCESS_SLEEPING && now >= wake->sleep_until) {
+            wake->state = PROCESS_READY;
+        }
+        wake = wake->next;
+    }
+
     process_cleanup_terminated();
 
     int ready_count = 0;
