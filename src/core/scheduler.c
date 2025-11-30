@@ -12,8 +12,20 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
     if (in_scheduler) return;
     in_scheduler = true;
 
+    // Wake sleeping processes whose deadlines have passed, even if the
+    // current task is the idle process. Otherwise sleepers would never
+    // transition back to READY when the scheduler is idle.
+    uint64_t now = timer_get_ticks();
+    process_t* wake = process_get_list();
+    while (wake) {
+        if (wake->state == PROCESS_SLEEPING && now >= wake->sleep_until) {
+            wake->state = PROCESS_READY;
+        }
+        wake = wake->next;
+    }
+
     process_t* current = process_current();
-    if (!current || current->pid == 0) {
+    if (!current) {
         in_scheduler = false;
         return;
     }
