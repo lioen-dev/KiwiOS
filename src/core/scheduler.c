@@ -18,9 +18,6 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         return;
     }
 
-    uint64_t cs = interrupt_rsp[16];
-    bool interrupted_usermode = (cs == 0x1B);
-
     //
     // -----------------------
     //  ALWAYS WAKE SLEEPERS
@@ -37,16 +34,6 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
     process_cleanup_terminated();
 
     //
-    // --------------------------------------------------
-    //  DO NOT PREEMPT KERNEL
-    // --------------------------------------------------
-    //
-    if (!interrupted_usermode) {
-        in_scheduler = false;
-        return;
-    }
-
-    //
     // Count ready user tasks (skip idle)
     //
     int ready_count = 0;
@@ -57,6 +44,7 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         p = p->next;
     }
 
+    // Don't bother switching if there is nothing to run besides idle
     if (ready_count == 0) {
         in_scheduler = false;
         return;
