@@ -639,7 +639,15 @@ void handle_usermode_exception(struct exception_frame *frame) {
     print(fb, "\nRIP: ");
     print_hex(fb, frame->rip);
     print(fb, "\n");
-    
+
+    // We are still using the faulting task's CR3. Switch back to the kernel
+    // address space before we clean up or try to run something else so that a
+    // freed user page table cannot trap us in more faults.
+    page_table_t* kpt = vmm_get_kernel_page_table();
+    if (kpt) {
+        vmm_switch_page_table(kpt);
+    }
+
     // Terminate the process
     proc->state = PROCESS_TERMINATED;
     

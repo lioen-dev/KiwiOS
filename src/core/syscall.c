@@ -745,7 +745,7 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
         case SYS_EXIT: {
             process_t* current = process_current();
-            
+
             if (current) {
                 // Close all file descriptors for this process
                 fd_close_all_for_process(current);
@@ -766,6 +766,20 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
             // No other usermode processes
             print(fb, "All processes finished\n");
+
+            // Fall back to the idle thread (or halt) instead of returning
+            // to a terminated userspace process.
+            process_t* idle = process_find_idle();
+            if (idle && idle != current) {
+                if (idle->state != PROCESS_READY && idle->state != PROCESS_RUNNING) {
+                    idle->state = PROCESS_READY;
+                }
+
+                process_switch_to(idle);
+            }
+
+            // If we couldn't find anything runnable, halt cleanly.
+            asm volatile("cli; hlt");
 
             break;
         }
