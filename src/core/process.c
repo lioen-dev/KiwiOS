@@ -11,6 +11,12 @@ process_t* process_list_head = NULL;
 static process_t* current_process = NULL;
 static uint32_t next_pid = 1;
 
+static void idle_thread(void) {
+    while (1) {
+        asm volatile ("hlt");
+    }
+}
+
 extern void switch_context(context_t* old_ctx, context_t* new_ctx);
 
 static void process_reset_fd_table(process_t* proc) {
@@ -50,26 +56,72 @@ static bool process_phys_is_reserved(process_t* proc, uint64_t phys) {
     return phys >= start && phys < end;
 }
 
+static process_t* process_create_kernel(const char* name, void (*entry_point)(void),
+                                        uint32_t pid) {
+    process_t* proc = (process_t*)kmalloc(sizeof(process_t));
+    if (!proc) return NULL;
+
+    memset(proc, 0, sizeof(process_t));
+
+    proc->has_been_interrupted = false;
+    proc->pid = pid;
+    proc->state = PROCESS_READY;
+    proc->start_ticks = timer_get_ticks();
+
+    process_reset_fd_table(proc);
+    process_reset_cwd(proc);
+
+    if (name) {
+        size_t len = strlen(name);
+        if (len >= 63) len = 63;
+        for (size_t i = 0; i < len; i++) {
+            proc->name[i] = name[i];
+        }
+        proc->name[len] = '\0';
+    }
+
+    uint64_t stack_phys = (uint64_t)pmm_alloc_pages(2);
+    if (!stack_phys) {
+        kfree(proc);
+        return NULL;
+    }
+
+    uint64_t stack_base = (uint64_t)phys_to_virt(stack_phys);
+    proc->stack_top = stack_base + (2 * PAGE_SIZE);
+
+    uint64_t* stack = (uint64_t*)proc->stack_top;
+    *(--stack) = (uint64_t)process_entry;
+
+    proc->context.rsp = (uint64_t)stack;
+    proc->context.rbp = 0;
+    proc->context.rbx = 0;
+    proc->context.r12 = (uint64_t)entry_point;
+    proc->context.r13 = 0;
+    proc->context.r14 = 0;
+    proc->context.r15 = 0;
+    proc->context.rflags = 0x202;
+
+    memset(&proc->interrupt_context, 0, sizeof(proc->interrupt_context));
+    proc->interrupt_context.rip    = (uint64_t)process_entry;
+    proc->interrupt_context.cs     = 0x08;
+    proc->interrupt_context.rflags = 0x202;
+    proc->interrupt_context.rsp    = proc->stack_top;
+    proc->interrupt_context.ss     = 0x10;
+    proc->interrupt_context.r12    = (uint64_t)entry_point;
+
+    proc->next = process_list_head;
+    process_list_head = proc;
+
+    return proc;
+}
+
 void process_init(void) {
-    process_t* idle = (process_t*)kmalloc(sizeof(process_t));
+    process_t* idle = process_create_kernel("idle", idle_thread, 0);
     if (!idle) return;
-    
-    memset(idle, 0, sizeof(process_t));
-    idle->pid = 0;
-    idle->name[0] = 'i';
-    idle->name[1] = 'd';
-    idle->name[2] = 'l';
-    idle->name[3] = 'e';
-    idle->name[4] = '\0';
+
     idle->state = PROCESS_RUNNING;
-    idle->next = NULL;
+    idle->has_been_interrupted = true; // We pretend idle already ran so we can switch to it safely
 
-    idle->start_ticks = timer_get_ticks();
-
-    process_reset_fd_table(idle);
-    process_reset_cwd(idle);
-
-    process_list_head = idle;
     current_process = idle;
 }
 
@@ -96,54 +148,7 @@ void process_entry(void) {
 }
 
 process_t* process_create(const char* name, void (*entry_point)(void)) {
-    process_t* proc = (process_t*)kmalloc(sizeof(process_t));
-    if (!proc) return NULL;
-    
-    memset(proc, 0, sizeof(process_t));
-
-    proc->has_been_interrupted = false;
-
-    proc->pid = next_pid++;
-    proc->state = PROCESS_READY;
-    proc->start_ticks = timer_get_ticks();
-
-    process_reset_fd_table(proc);
-    process_reset_cwd(proc);
-    
-    if (name) {
-        size_t len = strlen(name);
-        if (len >= 63) len = 63;
-        for (size_t i = 0; i < len; i++) {
-            proc->name[i] = name[i];
-        }
-        proc->name[len] = '\0';
-    }
-    
-    uint64_t stack_phys = (uint64_t)pmm_alloc_pages(2);
-    if (!stack_phys) {
-        kfree(proc);
-        return NULL;
-    }
-    
-    uint64_t stack_base = (uint64_t)phys_to_virt(stack_phys);
-    proc->stack_top = stack_base + (2 * PAGE_SIZE);
-    
-    uint64_t* stack = (uint64_t*)proc->stack_top;
-    *(--stack) = (uint64_t)process_entry;
-    
-    proc->context.rsp = (uint64_t)stack;
-    proc->context.rbp = 0;
-    proc->context.rbx = 0;
-    proc->context.r12 = (uint64_t)entry_point;
-    proc->context.r13 = 0;
-    proc->context.r14 = 0;
-    proc->context.r15 = 0;
-    proc->context.rflags = 0x202;
-    
-    proc->next = process_list_head;
-    process_list_head = proc;
-    
-    return proc;
+    return process_create_kernel(name, entry_point, next_pid++);
 }
 
 process_t* process_current(void) {
