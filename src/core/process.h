@@ -68,6 +68,7 @@ typedef struct process {
 
     uint64_t sleep_until;                  // Target tick to wake from sleep
     bool sleep_interrupted;                // True if a sleep was cut short
+    struct process* sleep_next;            // Linked-list node for sleep queue
 
     int last_errno;                        // errno-like value for syscalls
 

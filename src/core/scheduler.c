@@ -8,14 +8,60 @@
 #include <stdint.h>
 
 static volatile bool in_scheduler = false;
+static process_t* sleep_queue_head = NULL;
 
 static inline interrupt_context_t* frame_to_ctx(uint64_t* interrupt_rsp) {
     return (interrupt_context_t*)interrupt_rsp;
 }
 
+static void sleep_queue_remove(process_t* proc) {
+    if (!proc) return;
+
+    process_t* prev = NULL;
+    process_t* iter = sleep_queue_head;
+
+    while (iter) {
+        if (iter == proc) {
+            if (prev) {
+                prev->sleep_next = iter->sleep_next;
+            } else {
+                sleep_queue_head = iter->sleep_next;
+            }
+            proc->sleep_next = NULL;
+            return;
+        }
+        prev = iter;
+        iter = iter->sleep_next;
+    }
+}
+
+static void sleep_queue_insert(process_t* proc) {
+    if (!proc) return;
+
+    sleep_queue_remove(proc);
+
+    if (!sleep_queue_head || proc->sleep_until < sleep_queue_head->sleep_until) {
+        proc->sleep_next = sleep_queue_head;
+        sleep_queue_head = proc;
+        return;
+    }
+
+    process_t* iter = sleep_queue_head;
+    while (iter->sleep_next && iter->sleep_next->sleep_until <= proc->sleep_until) {
+        iter = iter->sleep_next;
+    }
+
+    proc->sleep_next = iter->sleep_next;
+    iter->sleep_next = proc;
+}
+
 static void wake_sleeping_processes(uint64_t now) {
-    for (process_t* proc = process_get_list(); proc; proc = proc->next) {
-        if (proc->state == PROCESS_SLEEPING && now >= proc->sleep_until) {
+    while (sleep_queue_head && now >= sleep_queue_head->sleep_until) {
+        process_t* proc = sleep_queue_head;
+        sleep_queue_head = proc->sleep_next;
+        proc->sleep_next = NULL;
+
+        if (proc->state == PROCESS_SLEEPING) {
             proc->state = PROCESS_READY;
         }
     }
@@ -94,6 +140,40 @@ static process_t* select_next_process(process_t* current) {
     }
 
     return find_idle_process();
+}
+
+bool scheduler_sleep_until(uint64_t* interrupt_rsp, uint64_t target_tick) {
+    process_t* current = process_current();
+    if (!current) {
+        return false;
+    }
+
+    interrupt_context_t* frame = interrupt_rsp ? frame_to_ctx(interrupt_rsp) : NULL;
+    if (frame) {
+        current->interrupt_context = *frame;
+        current->interrupt_context.rax = 0; // nanosleep-style success return value
+    }
+
+    current->has_been_interrupted = true;
+    current->sleep_until = target_tick;
+    current->state = PROCESS_SLEEPING;
+    current->sleep_interrupted = false;
+    current->sleep_next = NULL;
+
+    sleep_queue_insert(current);
+
+    if (scheduler_reschedule(interrupt_rsp)) {
+        return true; // Switched away; will resume when woken.
+    }
+
+    // Could not switch (should not happen with an idle task). Cancel the sleep.
+    sleep_queue_remove(current);
+    current->state = PROCESS_RUNNING;
+    return false;
+}
+
+void scheduler_cancel_sleep(process_t* proc) {
+    sleep_queue_remove(proc);
 }
 
 bool scheduler_reschedule(uint64_t* interrupt_rsp) {
