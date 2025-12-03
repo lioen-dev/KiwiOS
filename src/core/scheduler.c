@@ -18,9 +18,6 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         return;
     }
 
-    uint64_t cs = interrupt_rsp[16];
-    bool interrupted_usermode = (cs == 0x1B);
-
     //
     // -----------------------
     //  ALWAYS WAKE SLEEPERS
@@ -37,19 +34,6 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
     process_cleanup_terminated();
 
     //
-    // --------------------------------------------------
-    //  DO NOT PREEMPT KERNEL
-    // --------------------------------------------------
-    //
-    // Allow preemption of user processes even while they are executing kernel
-    // code (e.g., blocking syscalls), but avoid context switching away from
-    // the kernel idle task itself.
-    if (!interrupted_usermode && current->pid == 0) {
-        in_scheduler = false;
-        return;
-    }
-
-    //
     // Count ready user tasks (skip idle)
     //
     int ready_count = 0;
@@ -60,6 +44,7 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         p = p->next;
     }
 
+    // Don't bother switching if there is nothing to run besides idle
     if (ready_count == 0) {
         in_scheduler = false;
         return;
