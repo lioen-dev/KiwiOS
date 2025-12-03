@@ -130,18 +130,23 @@ static bool timespec_to_ticks(const k_timespec_t* ts, uint64_t freq, uint64_t* o
     if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL) {
         return false;
     }
-
-    __int128 ns_total = (__int128)ts->tv_sec * 1000000000 + ts->tv_nsec;
-    if (ns_total < 0) {
-        return false;
+    // Compute ticks = ceil((tv_sec * 1e9 + tv_nsec) * freq / 1e9)
+    // Split the computation to avoid 128-bit division support requirements.
+    if ((uint64_t)ts->tv_sec > UINT64_MAX / freq) {
+        return false; // sec * freq would overflow
     }
 
-    __int128 ticks = (ns_total * freq + 999999999) / 1000000000;
-    if (ticks < 0 || ticks > (__int128)UINT64_MAX) {
-        return false;
+    uint64_t sec_ticks = (uint64_t)ts->tv_sec * freq;
+
+    // tv_nsec < 1e9, so tv_nsec * freq fits in 64 bits for typical timer freqs.
+    uint64_t nsec_scaled = (uint64_t)ts->tv_nsec * freq;
+    uint64_t nsec_ticks = (nsec_scaled + 1000000000ULL - 1) / 1000000000ULL; // ceil division
+
+    if (UINT64_MAX - nsec_ticks < sec_ticks) {
+        return false; // total would overflow
     }
 
-    *out_ticks = (uint64_t)ticks;
+    *out_ticks = sec_ticks + nsec_ticks;
     return true;
 }
 
