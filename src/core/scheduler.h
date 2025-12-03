@@ -1,6 +1,9 @@
 #ifndef CORE_SCHEDULER_H
 #define CORE_SCHEDULER_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 void scheduler_init(void);
 
 // Force a reschedule using the provided interrupt stack frame. The frame layout

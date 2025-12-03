@@ -75,14 +75,23 @@ static process_t* select_next_process(process_t* current) {
 
     process_t* start = current && current->next ? current->next : head;
     process_t* iter = start;
+    process_t* candidate = NULL;
 
     do {
         if (iter->state == PROCESS_READY && iter->pid != 0) {
             return iter;
         }
 
+        if (!candidate && iter->state == PROCESS_RUNNING && iter == current) {
+            candidate = iter; // keep running if nothing else is ready
+        }
+
         iter = iter->next ? iter->next : head;
     } while (iter != start);
+
+    if (candidate) {
+        return candidate;
+    }
 
     return find_idle_process();
 }
