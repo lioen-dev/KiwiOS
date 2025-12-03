@@ -119,9 +119,8 @@ process_t* elf_load(const char* name, void* elf_data, size_t size) {
         return NULL;
     }
 
-    // Map the user stack near the top of the canonical lower-half address space
-    // so that RSP remains a valid canonical address when entering user mode.
-    #define USER_STACK_TOP 0x00007FFFFFFFF000ULL
+    // Map user stack to high address (0x800000000000)
+    #define USER_STACK_TOP 0x800000000000  // 8TB mark
     uint64_t user_stack_base = USER_STACK_TOP - (4 * PAGE_SIZE);
 
     for (int i = 0; i < 4; i++) {

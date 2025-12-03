@@ -8,25 +8,9 @@
 
 static volatile bool in_scheduler = false;
 
-static void wake_sleeping_processes(void) {
-    uint64_t now = timer_get_ticks();
-    process_t* wake = process_get_list();
-    while (wake) {
-        if (wake->state == PROCESS_SLEEPING && now >= wake->sleep_until) {
-            wake->state = PROCESS_READY;
-        }
-        wake = wake->next;
-    }
-}
-
 static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
     if (in_scheduler) return;
     in_scheduler = true;
-
-    // Wake sleeping processes whose deadlines have passed, even if the
-    // current task is the idle process. Otherwise sleepers would never
-    // transition back to READY when the scheduler is idle.
-    wake_sleeping_processes();
 
     process_t* current = process_current();
     if (!current) {
@@ -34,34 +18,42 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         return;
     }
 
-    if (current->is_usermode && !current->has_been_interrupted) {
-        uint64_t cs = interrupt_rsp[16];
-        if (cs == 0x1B) {
-            current->has_been_interrupted = true;
-        } else {
-            in_scheduler = false;
-            return;
-        }
-    }
+    uint64_t cs = interrupt_rsp[16];
+    bool interrupted_usermode = (cs == 0x1B);
 
-    // Wake sleeping processes whose deadlines have passed
+    //
+    // -----------------------
+    //  ALWAYS WAKE SLEEPERS
+    // -----------------------
+    //
     uint64_t now = timer_get_ticks();
     process_t* wake = process_get_list();
     while (wake) {
-        if (wake->state == PROCESS_SLEEPING && now >= wake->sleep_until) {
+        if (wake->state == PROCESS_SLEEPING && now >= wake->sleep_until)
             wake->state = PROCESS_READY;
-        }
         wake = wake->next;
     }
 
     process_cleanup_terminated();
 
+    //
+    // --------------------------------------------------
+    //  DO NOT PREEMPT KERNEL
+    // --------------------------------------------------
+    //
+    if (!interrupted_usermode) {
+        in_scheduler = false;
+        return;
+    }
+
+    //
+    // Count ready user tasks (skip idle)
+    //
     int ready_count = 0;
     process_t* p = process_get_list();
     while (p) {
-        if (p != current && p->state == PROCESS_READY && p->pid != 0) {
+        if (p->pid != 0 && p->state == PROCESS_READY)
             ready_count++;
-        }
         p = p->next;
     }
 
@@ -70,51 +62,68 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
         return;
     }
 
+    //
+    // Round-robin through tasks
+    //
     process_t* next = current->next;
     if (!next) next = process_get_list();
     process_t* start = next;
 
     while (next) {
-        if (next != current && next->state == PROCESS_READY && next->pid != 0) {
+        if (next->pid != 0 && next->state == PROCESS_READY) {
+
+            //
+            // ---------------------------
+            //   SAVE CURRENT CONTEXT
+            // ---------------------------
+            //
+            current->interrupt_context.r15    = interrupt_rsp[0];
+            current->interrupt_context.r14    = interrupt_rsp[1];
+            current->interrupt_context.r13    = interrupt_rsp[2];
+            current->interrupt_context.r12    = interrupt_rsp[3];
+            current->interrupt_context.r11    = interrupt_rsp[4];
+            current->interrupt_context.r10    = interrupt_rsp[5];
+            current->interrupt_context.r9     = interrupt_rsp[6];
+            current->interrupt_context.r8     = interrupt_rsp[7];
+            current->interrupt_context.rbp    = interrupt_rsp[8];
+            current->interrupt_context.rdi    = interrupt_rsp[9];
+            current->interrupt_context.rsi    = interrupt_rsp[10];
+            current->interrupt_context.rdx    = interrupt_rsp[11];
+            current->interrupt_context.rcx    = interrupt_rsp[12];
+            current->interrupt_context.rbx    = interrupt_rsp[13];
+            current->interrupt_context.rax    = interrupt_rsp[14];
+            current->interrupt_context.rip    = interrupt_rsp[15];
+            current->interrupt_context.cs     = interrupt_rsp[16];
+            current->interrupt_context.rflags = interrupt_rsp[17];
+            current->interrupt_context.rsp    = interrupt_rsp[18];
+            current->interrupt_context.ss     = interrupt_rsp[19];
+
+            current->state = PROCESS_READY;
+
+            //
+            // ----------------------------------------
+            //    FIRST-TIME CONTEXT LOAD FOR NEW TASK
+            // ----------------------------------------
+            //
             if (!next->has_been_interrupted) {
-                current->interrupt_context.r15 = interrupt_rsp[0];
-                current->interrupt_context.r14 = interrupt_rsp[1];
-                current->interrupt_context.r13 = interrupt_rsp[2];
-                current->interrupt_context.r12 = interrupt_rsp[3];
-                current->interrupt_context.r11 = interrupt_rsp[4];
-                current->interrupt_context.r10 = interrupt_rsp[5];
-                current->interrupt_context.r9  = interrupt_rsp[6];
-                current->interrupt_context.r8  = interrupt_rsp[7];
-                current->interrupt_context.rbp = interrupt_rsp[8];
-                current->interrupt_context.rdi = interrupt_rsp[9];
-                current->interrupt_context.rsi = interrupt_rsp[10];
-                current->interrupt_context.rdx = interrupt_rsp[11];
-                current->interrupt_context.rcx = interrupt_rsp[12];
-                current->interrupt_context.rbx = interrupt_rsp[13];
-                current->interrupt_context.rax = interrupt_rsp[14];
-                current->interrupt_context.rip = interrupt_rsp[15];
-                current->interrupt_context.cs = interrupt_rsp[16];
-                current->interrupt_context.rflags = interrupt_rsp[17];
-                current->interrupt_context.rsp = interrupt_rsp[18];
-                current->interrupt_context.ss = interrupt_rsp[19];
 
-                current->state = PROCESS_READY;
+                // load entrypoint context
+                for (int i = 0; i < 15; i++)
+                    interrupt_rsp[i] = 0;
 
-                for (int i = 0; i < 15; i++) interrupt_rsp[i] = 0;
                 interrupt_rsp[15] = next->interrupt_context.rip;
                 interrupt_rsp[16] = next->interrupt_context.cs;
                 interrupt_rsp[17] = next->interrupt_context.rflags;
                 interrupt_rsp[18] = next->interrupt_context.rsp;
                 interrupt_rsp[19] = next->interrupt_context.ss;
 
-                next->state = PROCESS_RUNNING;
                 next->has_been_interrupted = true;
+                next->state = PROCESS_RUNNING;
 
                 tss_set_kernel_stack(next->stack_top);
 
-                if (next->page_table) {
+                if (next->page_table)
                     vmm_switch_page_table(next->page_table);
-                }
 
                 process_set_current(next);
 
@@ -122,40 +131,23 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
                 return;
             }
 
-            current->interrupt_context.r15 = interrupt_rsp[0];
-            current->interrupt_context.r14 = interrupt_rsp[1];
-            current->interrupt_context.r13 = interrupt_rsp[2];
-            current->interrupt_context.r12 = interrupt_rsp[3];
-            current->interrupt_context.r11 = interrupt_rsp[4];
-            current->interrupt_context.r10 = interrupt_rsp[5];
-            current->interrupt_context.r9  = interrupt_rsp[6];
-            current->interrupt_context.r8  = interrupt_rsp[7];
-            current->interrupt_context.rbp = interrupt_rsp[8];
-            current->interrupt_context.rdi = interrupt_rsp[9];
-            current->interrupt_context.rsi = interrupt_rsp[10];
-            current->interrupt_context.rdx = interrupt_rsp[11];
-            current->interrupt_context.rcx = interrupt_rsp[12];
-            current->interrupt_context.rbx = interrupt_rsp[13];
-            current->interrupt_context.rax = interrupt_rsp[14];
-            current->interrupt_context.rip = interrupt_rsp[15];
-            current->interrupt_context.cs = interrupt_rsp[16];
-            current->interrupt_context.rflags = interrupt_rsp[17];
-            current->interrupt_context.rsp = interrupt_rsp[18];
-            current->interrupt_context.ss = interrupt_rsp[19];
-
-            current->state = PROCESS_READY;
+            //
+            // ------------------------------------
+            //     NORMAL CONTEXT SWITCH
+            // ------------------------------------
+            //
             next->state = PROCESS_RUNNING;
 
-            interrupt_rsp[0] = next->interrupt_context.r15;
-            interrupt_rsp[1] = next->interrupt_context.r14;
-            interrupt_rsp[2] = next->interrupt_context.r13;
-            interrupt_rsp[3] = next->interrupt_context.r12;
-            interrupt_rsp[4] = next->interrupt_context.r11;
-            interrupt_rsp[5] = next->interrupt_context.r10;
-            interrupt_rsp[6] = next->interrupt_context.r9;
-            interrupt_rsp[7] = next->interrupt_context.r8;
-            interrupt_rsp[8] = next->interrupt_context.rbp;
-            interrupt_rsp[9] = next->interrupt_context.rdi;
+            interrupt_rsp[0]  = next->interrupt_context.r15;
+            interrupt_rsp[1]  = next->interrupt_context.r14;
+            interrupt_rsp[2]  = next->interrupt_context.r13;
+            interrupt_rsp[3]  = next->interrupt_context.r12;
+            interrupt_rsp[4]  = next->interrupt_context.r11;
+            interrupt_rsp[5]  = next->interrupt_context.r10;
+            interrupt_rsp[6]  = next->interrupt_context.r9;
+            interrupt_rsp[7]  = next->interrupt_context.r8;
+            interrupt_rsp[8]  = next->interrupt_context.rbp;
+            interrupt_rsp[9]  = next->interrupt_context.rdi;
             interrupt_rsp[10] = next->interrupt_context.rsi;
             interrupt_rsp[11] = next->interrupt_context.rdx;
             interrupt_rsp[12] = next->interrupt_context.rcx;
@@ -169,9 +161,8 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
 
             tss_set_kernel_stack(next->stack_top);
 
-            if (next->page_table) {
+            if (next->page_table)
                 vmm_switch_page_table(next->page_table);
-            }
 
             process_set_current(next);
 
@@ -181,7 +172,8 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
 
         next = next->next;
         if (!next) next = process_get_list();
-        if (next == start) break;
+        if (next == start)
+            break;
     }
 
     in_scheduler = false;
