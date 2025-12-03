@@ -41,7 +41,10 @@ static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
     //  DO NOT PREEMPT KERNEL
     // --------------------------------------------------
     //
-    if (!interrupted_usermode) {
+    // Allow preemption of user processes even while they are executing kernel
+    // code (e.g., blocking syscalls), but avoid context switching away from
+    // the kernel idle task itself.
+    if (!interrupted_usermode && current->pid == 0) {
         in_scheduler = false;
         return;
     }
