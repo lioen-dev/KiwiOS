@@ -1,4 +1,5 @@
 #include "core/process.h"
+#include "core/scheduler.h"
 #include "memory/heap.h"
 #include "memory/pmm.h"
 #include "arch/x86/tss.h"
@@ -159,6 +160,16 @@ process_t* process_get_list(void) {
     return process_list_head;
 }
 
+process_t* process_find_idle(void) {
+    for (process_t* proc = process_list_head; proc; proc = proc->next) {
+        if (proc->pid == 0) {
+            return proc;
+        }
+    }
+
+    return NULL;
+}
+
 void process_switch_to(process_t* next) {
     if (!next) return;
     if (next == process_current()) return;
@@ -246,6 +257,9 @@ void process_destroy(process_t* proc) {
     if (!proc) return;
     extern void syscall_on_process_exit(process_t* proc_ref);
     syscall_on_process_exit(proc);
+
+    // Remove from sleep queue if queued
+    scheduler_cancel_sleep(proc);
     
     // Free kernel stack
     if (proc->stack_top) {
