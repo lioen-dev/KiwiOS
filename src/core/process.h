@@ -68,6 +68,7 @@ typedef struct process {
 
     uint64_t sleep_until;                  // Target tick to wake from sleep
     bool sleep_interrupted;                // True if a sleep was cut short
+    struct process* sleep_next;            // Linked-list node for sleep queue
 
     int last_errno;                        // errno-like value for syscalls
 
@@ -84,6 +85,7 @@ void process_init(void);
 process_t* process_create(const char* name, void (*entry_point)(void));
 process_t* process_current(void);
 process_t* process_get_list(void);
+process_t* process_find_idle(void);
 void process_switch_to(process_t* next);
 
 extern process_t* process_list_head;

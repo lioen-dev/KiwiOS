@@ -85,69 +85,82 @@ static void set_errno(process_t* proc, int err) {
     }
 }
 
-static void save_interrupt_context_from_frame(process_t* proc, syscall_frame_t* frame) {
-    if (!proc || !frame) {
-        return;
-    }
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} k_timespec_t;
 
-    proc->interrupt_context.r15 = frame->r15;
-    proc->interrupt_context.r14 = frame->r14;
-    proc->interrupt_context.r13 = frame->r13;
-    proc->interrupt_context.r12 = frame->r12;
-    proc->interrupt_context.r11 = frame->r11;
-    proc->interrupt_context.r10 = frame->r10;
-    proc->interrupt_context.r9  = frame->r9;
-    proc->interrupt_context.r8  = frame->r8;
-    proc->interrupt_context.rbp = frame->rbp;
-    proc->interrupt_context.rdi = frame->rdi;
-    proc->interrupt_context.rsi = frame->rsi;
-    proc->interrupt_context.rdx = frame->rdx;
-    proc->interrupt_context.rcx = frame->rcx;
-    proc->interrupt_context.rbx = frame->rbx;
-    proc->interrupt_context.rax = frame->rax;
-    proc->interrupt_context.rip = frame->rip;
-    proc->interrupt_context.cs  = frame->cs;
-    proc->interrupt_context.rflags = frame->rflags;
-    proc->interrupt_context.rsp = frame->rsp;
-    proc->interrupt_context.ss  = frame->ss;
-}
-
-// Convert milliseconds to timer ticks using 64-bit arithmetic; returns false on overflow
-static bool ms_to_ticks(uint64_t ms, uint64_t freq, uint64_t* out_ticks) {
-    if (!out_ticks || freq == 0) {
+// Copy a userspace timespec into kernel memory
+static bool copy_user_timespec(uint64_t user_ptr, k_timespec_t* out) {
+    if (!out || !user_ptr) {
         return false;
     }
 
-    if (ms != 0 && ms > UINT64_MAX / freq) {
+    if (!is_userspace_ptr(user_ptr, sizeof(k_timespec_t))) {
         return false;
     }
 
-    uint64_t product = ms * freq;
-    *out_ticks = product / 1000;
+    k_timespec_t* user_ts = (k_timespec_t*)user_ptr;
+    out->tv_sec = user_ts->tv_sec;
+    out->tv_nsec = user_ts->tv_nsec;
     return true;
 }
 
-static bool request_sleep_until(syscall_frame_t* frame, uint64_t target_tick) {
-    process_t* current = process_current();
-    if (!current) {
+// Write a timespec back to userspace (best-effort)
+static void write_user_timespec_zero(uint64_t user_ptr) {
+    if (!user_ptr) {
+        return;
+    }
+
+    if (!is_userspace_ptr(user_ptr, sizeof(k_timespec_t))) {
+        return;
+    }
+
+    k_timespec_t* user_ts = (k_timespec_t*)user_ptr;
+    user_ts->tv_sec = 0;
+    user_ts->tv_nsec = 0;
+}
+
+// Convert a POSIX timespec into timer ticks (rounded up) with overflow checks
+static bool timespec_to_ticks(const k_timespec_t* ts, uint64_t freq, uint64_t* out_ticks) {
+    if (!ts || !out_ticks || freq == 0) {
         return false;
     }
 
-    current->sleep_until = target_tick;
-    current->state = PROCESS_SLEEPING;
-    current->sleep_interrupted = false;
-
-    save_interrupt_context_from_frame(current, frame);
-    current->interrupt_context.rax = 0;
-    current->has_been_interrupted = true;
-
-    if (scheduler_reschedule((uint64_t*)frame)) {
-        return true;
+    if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL) {
+        return false;
+    }
+    // Compute ticks = ceil((tv_sec * 1e9 + tv_nsec) * freq / 1e9)
+    // Split the computation to avoid 128-bit division support requirements.
+    if ((uint64_t)ts->tv_sec > UINT64_MAX / freq) {
+        return false; // sec * freq would overflow
     }
 
-    // If no other process could be scheduled, put the current one back
-    current->state = PROCESS_RUNNING;
-    return false;
+    uint64_t sec_ticks = (uint64_t)ts->tv_sec * freq;
+
+    // tv_nsec < 1e9, so tv_nsec * freq fits in 64 bits for typical timer freqs.
+    uint64_t nsec_scaled = (uint64_t)ts->tv_nsec * freq;
+    uint64_t nsec_ticks = (nsec_scaled + 1000000000ULL - 1) / 1000000000ULL; // ceil division
+
+    if (UINT64_MAX - nsec_ticks < sec_ticks) {
+        return false; // total would overflow
+    }
+
+    *out_ticks = sec_ticks + nsec_ticks;
+    return true;
+}
+
+static bool ms_to_ticks(uint64_t ms, uint64_t freq, uint64_t* out_ticks) {
+    if (!out_ticks) {
+        return false;
+    }
+
+    k_timespec_t ts = {
+        .tv_sec = (int64_t)(ms / 1000),
+        .tv_nsec = (int64_t)((ms % 1000) * 1000000ULL),
+    };
+
+    return timespec_to_ticks(&ts, freq, out_ticks);
 }
 
 static bool range_is_free(process_t* proc, uint64_t base, uint64_t pages) {
@@ -244,24 +257,57 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
             break;
         }
 
-        case SYS_SLEEP: {
-            uint64_t ms = arg1;
-            uint64_t freq = timer_get_frequency();
+        case SYS_SLEEP: { // POSIX nanosleep(req, rem)
             process_t* current = process_current();
-            uint64_t ticks = 0;
+            uint64_t freq = timer_get_frequency();
 
-            if (!current || !ms_to_ticks(ms, freq, &ticks)) {
+            if (!current) {
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            k_timespec_t req;
+            bool have_rem = arg2 != 0;
+
+            if (!copy_user_timespec(arg1, &req)) {
+                set_errno(current, K_EFAULT);
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            if (have_rem && !is_userspace_ptr(arg2, sizeof(k_timespec_t))) {
+                set_errno(current, K_EFAULT);
+                retval = (uint64_t)-1;
+                break;
+            }
+
+            uint64_t ticks = 0;
+            if (!timespec_to_ticks(&req, freq, &ticks)) {
                 set_errno(current, K_EINVAL);
                 retval = (uint64_t)-1;
                 break;
             }
 
-            uint64_t target = timer_get_ticks() + ticks;
-
-            if (request_sleep_until(frame, target)) {
-                return;
+            if (ticks == 0) {
+                if (have_rem) {
+                    write_user_timespec_zero(arg2);
+                }
+                retval = 0;
+                break;
             }
 
+            uint64_t target = timer_get_ticks() + ticks;
+
+            if (scheduler_sleep_until((uint64_t*)frame, target)) {
+                if (have_rem) {
+                    write_user_timespec_zero(arg2);
+                }
+                return; // Resume after wake-up
+            }
+
+            if (have_rem) {
+                write_user_timespec_zero(arg2);
+            }
             retval = 0;
             break;
         }
@@ -745,7 +791,7 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
         case SYS_EXIT: {
             process_t* current = process_current();
-            
+
             if (current) {
                 // Close all file descriptors for this process
                 fd_close_all_for_process(current);
@@ -766,6 +812,20 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
             // No other usermode processes
             print(fb, "All processes finished\n");
+
+            // Fall back to the idle thread (or halt) instead of returning
+            // to a terminated userspace process.
+            process_t* idle = process_find_idle();
+            if (idle && idle != current) {
+                if (idle->state != PROCESS_READY && idle->state != PROCESS_RUNNING) {
+                    idle->state = PROCESS_READY;
+                }
+
+                process_switch_to(idle);
+            }
+
+            // If we couldn't find anything runnable, halt cleanly.
+            asm volatile("cli; hlt");
 
             break;
         }
@@ -789,7 +849,7 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
             uint64_t target = timer_get_ticks() + ticks;
 
-            if (request_sleep_until(frame, target)) {
+            if (scheduler_sleep_until((uint64_t*)frame, target)) {
                 return;
             }
 
@@ -808,7 +868,7 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
             uint64_t target = timer_get_ticks() + ticks;
 
-            if (request_sleep_until(frame, target)) {
+            if (scheduler_sleep_until((uint64_t*)frame, target)) {
                 return;
             }
 
