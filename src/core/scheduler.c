@@ -106,12 +106,24 @@ bool scheduler_reschedule(uint64_t* interrupt_rsp) {
         return false;
     }
 
+    page_table_t* kernel_pt = vmm_get_kernel_page_table();
+    page_table_t* current_pt = current->page_table ? current->page_table : kernel_pt;
+    bool switched_to_kernel = false;
+
+    if (current_pt != kernel_pt) {
+        vmm_switch_page_table(kernel_pt);
+        switched_to_kernel = true;
+    }
+
     uint64_t now = timer_get_ticks();
     wake_sleeping_processes(now);
     process_cleanup_terminated();
 
     process_t* next = select_next_process(current);
     if (!next || next == current) {
+        if (switched_to_kernel) {
+            vmm_switch_page_table(current_pt);
+        }
         in_scheduler = false;
         return false;
     }

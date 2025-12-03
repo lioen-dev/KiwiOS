@@ -84,6 +84,7 @@ void process_init(void);
 process_t* process_create(const char* name, void (*entry_point)(void));
 process_t* process_current(void);
 process_t* process_get_list(void);
+process_t* process_find_idle(void);
 void process_switch_to(process_t* next);
 
 extern process_t* process_list_head;

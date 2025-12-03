@@ -159,6 +159,16 @@ process_t* process_get_list(void) {
     return process_list_head;
 }
 
+process_t* process_find_idle(void) {
+    for (process_t* proc = process_list_head; proc; proc = proc->next) {
+        if (proc->pid == 0) {
+            return proc;
+        }
+    }
+
+    return NULL;
+}
+
 void process_switch_to(process_t* next) {
     if (!next) return;
     if (next == process_current()) return;
