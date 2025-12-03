@@ -1,5 +1,6 @@
 #include "core/syscall.h"
 #include "core/process.h"
+#include "core/scheduler.h"
 #include "limine.h"
 #include "arch/x86/tss.h"
 #include "drivers/timer.h"
@@ -126,119 +127,6 @@ static bool ms_to_ticks(uint64_t ms, uint64_t freq, uint64_t* out_ticks) {
     return true;
 }
 
-static bool switch_to_next_process(syscall_frame_t* frame, process_t* current) {
-    process_cleanup_terminated();
-
-    process_t* next = process_get_list();
-    while (next) {
-        if (next != current && next->state == PROCESS_READY && next->pid != 0) {
-            if (next->has_been_interrupted) {
-                frame->r15 = next->interrupt_context.r15;
-                frame->r14 = next->interrupt_context.r14;
-                frame->r13 = next->interrupt_context.r13;
-                frame->r12 = next->interrupt_context.r12;
-                frame->r11 = next->interrupt_context.r11;
-                frame->r10 = next->interrupt_context.r10;
-                frame->r9  = next->interrupt_context.r9;
-                frame->r8  = next->interrupt_context.r8;
-                frame->rbp = next->interrupt_context.rbp;
-                frame->rdi = next->interrupt_context.rdi;
-                frame->rsi = next->interrupt_context.rsi;
-                frame->rdx = next->interrupt_context.rdx;
-                frame->rcx = next->interrupt_context.rcx;
-                frame->rbx = next->interrupt_context.rbx;
-                frame->rax = next->interrupt_context.rax;
-                frame->rip = next->interrupt_context.rip;
-                frame->cs  = next->interrupt_context.cs;
-                frame->rflags = next->interrupt_context.rflags;
-                frame->rsp = next->interrupt_context.rsp;
-                frame->ss  = next->interrupt_context.ss;
-            } else {
-                frame->r15 = 0;
-                frame->r14 = 0;
-                frame->r13 = 0;
-                frame->r12 = 0;
-                frame->r11 = 0;
-                frame->r10 = 0;
-                frame->r9  = 0;
-                frame->r8  = 0;
-                frame->rbp = 0;
-                frame->rdi = 0;
-                frame->rsi = 0;
-                frame->rdx = 0;
-                frame->rcx = 0;
-                frame->rbx = 0;
-                frame->rax = 0;
-                frame->rip = next->interrupt_context.rip;
-                frame->cs  = next->interrupt_context.cs;
-                frame->rflags = next->interrupt_context.rflags;
-                frame->rsp = next->interrupt_context.rsp;
-                frame->ss  = next->interrupt_context.ss;
-                next->has_been_interrupted = true;
-            }
-
-            next->state = PROCESS_RUNNING;
-            tss_set_kernel_stack(next->stack_top);
-
-            if (next->page_table) {
-                extern void vmm_switch_page_table(page_table_t* pt);
-                vmm_switch_page_table(next->page_table);
-            }
-
-            extern void process_set_current(process_t* proc);
-            process_set_current(next);
-            return true;
-        }
-        next = next->next;
-    }
-
-    // No ready user processes, fall back to idle if possible
-    next = process_get_list();
-    while (next) {
-        if (next->pid == 0) {
-            break;
-        }
-        next = next->next;
-    }
-
-    if (next && next->context.rsp != 0) {
-        uint64_t* saved_stack = (uint64_t*)next->context.rsp;
-        uint64_t return_addr = saved_stack[0];
-
-        frame->rip = return_addr;
-        frame->cs  = 0x08;
-        frame->ss  = 0x10;
-        frame->rflags = next->context.rflags;
-        frame->rsp = next->context.rsp + 8;
-
-        frame->rbp = next->context.rbp;
-        frame->rbx = next->context.rbx;
-        frame->r12 = next->context.r12;
-        frame->r13 = next->context.r13;
-        frame->r14 = next->context.r14;
-        frame->r15 = next->context.r15;
-
-        frame->rax = 0;
-        frame->rcx = 0;
-        frame->rdx = 0;
-        frame->rsi = 0;
-        frame->rdi = 0;
-        frame->r8  = 0;
-        frame->r9  = 0;
-        frame->r10 = 0;
-        frame->r11 = 0;
-
-        vmm_switch_page_table(vmm_get_kernel_page_table());
-        tss_set_kernel_stack(next->stack_top);
-
-        extern void process_set_current(process_t* proc);
-        process_set_current(next);
-        return true;
-    }
-
-    return false;
-}
-
 static bool request_sleep_until(syscall_frame_t* frame, uint64_t target_tick) {
     process_t* current = process_current();
     if (!current) {
@@ -253,7 +141,7 @@ static bool request_sleep_until(syscall_frame_t* frame, uint64_t target_tick) {
     current->interrupt_context.rax = 0;
     current->has_been_interrupted = true;
 
-    if (switch_to_next_process(frame, current)) {
+    if (scheduler_reschedule((uint64_t*)frame)) {
         return true;
     }
 
@@ -872,7 +760,7 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 
             process_cleanup_terminated();
 
-            if (switch_to_next_process(frame, current)) {
+            if (scheduler_reschedule((uint64_t*)frame)) {
                 return;
             }
 

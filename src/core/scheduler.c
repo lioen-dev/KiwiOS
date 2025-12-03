@@ -1,170 +1,138 @@
 #include "core/scheduler.h"
+#include "arch/x86/tss.h"
 #include "core/process.h"
 #include "drivers/timer.h"
-#include "arch/x86/tss.h"
 #include "memory/vmm.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
 static volatile bool in_scheduler = false;
 
-static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
-    if (in_scheduler) return;
+static inline interrupt_context_t* frame_to_ctx(uint64_t* interrupt_rsp) {
+    return (interrupt_context_t*)interrupt_rsp;
+}
+
+static void wake_sleeping_processes(uint64_t now) {
+    for (process_t* proc = process_get_list(); proc; proc = proc->next) {
+        if (proc->state == PROCESS_SLEEPING && now >= proc->sleep_until) {
+            proc->state = PROCESS_READY;
+        }
+    }
+}
+
+static void save_running_context(process_t* current, uint64_t* interrupt_rsp) {
+    if (!current || !interrupt_rsp) {
+        return;
+    }
+
+    interrupt_context_t* frame = frame_to_ctx(interrupt_rsp);
+    current->interrupt_context = *frame;
+    current->has_been_interrupted = true;
+
+    if (current->state == PROCESS_RUNNING && current->pid != 0) {
+        current->state = PROCESS_READY;
+    }
+}
+
+static void load_first_context(process_t* next, uint64_t* interrupt_rsp) {
+    interrupt_context_t* frame = frame_to_ctx(interrupt_rsp);
+
+    // Zero all registers so we start with a clean slate
+    for (int i = 0; i < 15; i++) {
+        interrupt_rsp[i] = 0;
+    }
+
+    frame->rip    = next->interrupt_context.rip;
+    frame->cs     = next->interrupt_context.cs;
+    frame->rflags = next->interrupt_context.rflags;
+    frame->rsp    = next->interrupt_context.rsp;
+    frame->ss     = next->interrupt_context.ss;
+
+    // Preserve r12 for kernel threads so process_entry can grab the entry point
+    frame->r12 = next->interrupt_context.r12;
+
+    next->has_been_interrupted = true;
+}
+
+static void load_saved_context(process_t* next, uint64_t* interrupt_rsp) {
+    interrupt_context_t* frame = frame_to_ctx(interrupt_rsp);
+    *frame = next->interrupt_context;
+}
+
+static process_t* find_idle_process(void) {
+    for (process_t* proc = process_get_list(); proc; proc = proc->next) {
+        if (proc->pid == 0) {
+            return proc;
+        }
+    }
+    return NULL;
+}
+
+static process_t* select_next_process(process_t* current) {
+    process_t* head = process_get_list();
+    if (!head) return NULL;
+
+    process_t* start = current && current->next ? current->next : head;
+    process_t* iter = start;
+
+    do {
+        if (iter->state == PROCESS_READY && iter->pid != 0) {
+            return iter;
+        }
+
+        iter = iter->next ? iter->next : head;
+    } while (iter != start);
+
+    return find_idle_process();
+}
+
+bool scheduler_reschedule(uint64_t* interrupt_rsp) {
+    if (in_scheduler) return false;
     in_scheduler = true;
 
     process_t* current = process_current();
     if (!current) {
         in_scheduler = false;
-        return;
+        return false;
     }
 
-    //
-    // -----------------------
-    //  ALWAYS WAKE SLEEPERS
-    // -----------------------
-    //
     uint64_t now = timer_get_ticks();
-    process_t* wake = process_get_list();
-    while (wake) {
-        if (wake->state == PROCESS_SLEEPING && now >= wake->sleep_until)
-            wake->state = PROCESS_READY;
-        wake = wake->next;
-    }
-
+    wake_sleeping_processes(now);
     process_cleanup_terminated();
 
-    //
-    // Count ready user tasks (skip idle)
-    //
-    int ready_count = 0;
-    process_t* p = process_get_list();
-    while (p) {
-        if (p->pid != 0 && p->state == PROCESS_READY)
-            ready_count++;
-        p = p->next;
-    }
-
-    // Don't bother switching if there is nothing to run besides idle
-    if (ready_count == 0) {
+    process_t* next = select_next_process(current);
+    if (!next || next == current) {
         in_scheduler = false;
-        return;
+        return false;
     }
 
-    //
-    // Round-robin through tasks
-    //
-    process_t* next = current->next;
-    if (!next) next = process_get_list();
-    process_t* start = next;
+    save_running_context(current, interrupt_rsp);
 
-    while (next) {
-        if (next->pid != 0 && next->state == PROCESS_READY) {
+    next->state = PROCESS_RUNNING;
 
-            //
-            // ---------------------------
-            //   SAVE CURRENT CONTEXT
-            // ---------------------------
-            //
-            current->interrupt_context.r15    = interrupt_rsp[0];
-            current->interrupt_context.r14    = interrupt_rsp[1];
-            current->interrupt_context.r13    = interrupt_rsp[2];
-            current->interrupt_context.r12    = interrupt_rsp[3];
-            current->interrupt_context.r11    = interrupt_rsp[4];
-            current->interrupt_context.r10    = interrupt_rsp[5];
-            current->interrupt_context.r9     = interrupt_rsp[6];
-            current->interrupt_context.r8     = interrupt_rsp[7];
-            current->interrupt_context.rbp    = interrupt_rsp[8];
-            current->interrupt_context.rdi    = interrupt_rsp[9];
-            current->interrupt_context.rsi    = interrupt_rsp[10];
-            current->interrupt_context.rdx    = interrupt_rsp[11];
-            current->interrupt_context.rcx    = interrupt_rsp[12];
-            current->interrupt_context.rbx    = interrupt_rsp[13];
-            current->interrupt_context.rax    = interrupt_rsp[14];
-            current->interrupt_context.rip    = interrupt_rsp[15];
-            current->interrupt_context.cs     = interrupt_rsp[16];
-            current->interrupt_context.rflags = interrupt_rsp[17];
-            current->interrupt_context.rsp    = interrupt_rsp[18];
-            current->interrupt_context.ss     = interrupt_rsp[19];
-
-            current->state = PROCESS_READY;
-
-            //
-            // ----------------------------------------
-            //    FIRST-TIME CONTEXT LOAD FOR NEW TASK
-            // ----------------------------------------
-            //
-            if (!next->has_been_interrupted) {
-
-                // load entrypoint context
-                for (int i = 0; i < 15; i++)
-                    interrupt_rsp[i] = 0;
-
-                interrupt_rsp[15] = next->interrupt_context.rip;
-                interrupt_rsp[16] = next->interrupt_context.cs;
-                interrupt_rsp[17] = next->interrupt_context.rflags;
-                interrupt_rsp[18] = next->interrupt_context.rsp;
-                interrupt_rsp[19] = next->interrupt_context.ss;
-
-                next->has_been_interrupted = true;
-                next->state = PROCESS_RUNNING;
-
-                tss_set_kernel_stack(next->stack_top);
-
-                if (next->page_table)
-                    vmm_switch_page_table(next->page_table);
-
-                process_set_current(next);
-
-                in_scheduler = false;
-                return;
-            }
-
-            //
-            // ------------------------------------
-            //     NORMAL CONTEXT SWITCH
-            // ------------------------------------
-            //
-            next->state = PROCESS_RUNNING;
-
-            interrupt_rsp[0]  = next->interrupt_context.r15;
-            interrupt_rsp[1]  = next->interrupt_context.r14;
-            interrupt_rsp[2]  = next->interrupt_context.r13;
-            interrupt_rsp[3]  = next->interrupt_context.r12;
-            interrupt_rsp[4]  = next->interrupt_context.r11;
-            interrupt_rsp[5]  = next->interrupt_context.r10;
-            interrupt_rsp[6]  = next->interrupt_context.r9;
-            interrupt_rsp[7]  = next->interrupt_context.r8;
-            interrupt_rsp[8]  = next->interrupt_context.rbp;
-            interrupt_rsp[9]  = next->interrupt_context.rdi;
-            interrupt_rsp[10] = next->interrupt_context.rsi;
-            interrupt_rsp[11] = next->interrupt_context.rdx;
-            interrupt_rsp[12] = next->interrupt_context.rcx;
-            interrupt_rsp[13] = next->interrupt_context.rbx;
-            interrupt_rsp[14] = next->interrupt_context.rax;
-            interrupt_rsp[15] = next->interrupt_context.rip;
-            interrupt_rsp[16] = next->interrupt_context.cs;
-            interrupt_rsp[17] = next->interrupt_context.rflags;
-            interrupt_rsp[18] = next->interrupt_context.rsp;
-            interrupt_rsp[19] = next->interrupt_context.ss;
-
-            tss_set_kernel_stack(next->stack_top);
-
-            if (next->page_table)
-                vmm_switch_page_table(next->page_table);
-
-            process_set_current(next);
-
-            in_scheduler = false;
-            return;
-        }
-
-        next = next->next;
-        if (!next) next = process_get_list();
-        if (next == start)
-            break;
+    if (next->has_been_interrupted) {
+        load_saved_context(next, interrupt_rsp);
+    } else {
+        load_first_context(next, interrupt_rsp);
     }
+
+    tss_set_kernel_stack(next->stack_top);
+
+    page_table_t* target = next->page_table ? next->page_table
+                                           : vmm_get_kernel_page_table();
+    vmm_switch_page_table(target);
+
+    process_set_current(next);
 
     in_scheduler = false;
+    return true;
+}
+
+static void scheduler_tick_handler(uint64_t* interrupt_rsp) {
+    // Use the interrupt frame to drive preemption. The timer handler only
+    // invokes us periodically, so we simply attempt to reschedule each time.
+    scheduler_reschedule(interrupt_rsp);
 }
 
 void scheduler_init(void) {
