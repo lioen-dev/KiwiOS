@@ -86,6 +86,7 @@ void process_init_common(process_t* proc, const char* name, uint32_t pid,
     proc->state = PROCESS_READY;
     proc->is_usermode = is_usermode;
     proc->has_been_interrupted = false;
+    proc->uses_linux_abi = false;
     proc->start_ticks = timer_get_ticks();
     proc->parent = parent;
     proc->exit_status = 0;

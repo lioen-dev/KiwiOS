@@ -64,6 +64,7 @@ typedef struct process {
     page_table_t* page_table;              // Per-process page table (NULL = use kernel PT)
     bool is_usermode;                      // True if this runs in ring 3
     bool has_been_interrupted;             // True after first timer interrupt
+    bool uses_linux_abi;                   // True if syscalls follow Linux ABI
 
     // Track device mappings that must not be returned to the PMM
     uint64_t fb_mapping_phys_base;
