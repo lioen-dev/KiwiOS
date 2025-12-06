@@ -52,12 +52,19 @@ static bool is_userspace_ptr(uint64_t ptr, size_t len) {
     return true;
 }
 
+static bool validate_user_buffer(uint64_t ptr, size_t len) {
+    if (len == 0) {
+        return false;
+    }
+    return is_userspace_ptr(ptr, len);
+}
+
 // Validate and get string length (max 4096 bytes)
 static bool validate_user_string(const char* str, size_t* out_len) {
     if (!is_userspace_ptr((uint64_t)str, 1)) {
         return false;
     }
-    
+
     size_t len = 0;
     while (len < 4096) {
         if (!is_userspace_ptr((uint64_t)(str + len), 1)) {
@@ -70,6 +77,32 @@ static bool validate_user_string(const char* str, size_t* out_len) {
         len++;
     }
     return false;
+}
+
+static bool copy_from_user(uint64_t user_ptr, void* dst, size_t len) {
+    if (!dst || !validate_user_buffer(user_ptr, len)) {
+        return false;
+    }
+
+    const uint8_t* src = (const uint8_t*)user_ptr;
+    uint8_t* out = (uint8_t*)dst;
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = src[i];
+    }
+    return true;
+}
+
+static bool copy_to_user(uint64_t user_ptr, const void* src, size_t len) {
+    if (!src || !validate_user_buffer(user_ptr, len)) {
+        return false;
+    }
+
+    const uint8_t* in = (const uint8_t*)src;
+    uint8_t* dest = (uint8_t*)user_ptr;
+    for (size_t i = 0; i < len; ++i) {
+        dest[i] = in[i];
+    }
+    return true;
 }
 
 // Full register frame
@@ -90,20 +123,23 @@ typedef struct {
     int64_t tv_nsec;
 } k_timespec_t;
 
+typedef struct {
+    uint64_t value;
+    bool should_return;
+} syscall_result_t;
+
+typedef syscall_result_t (*syscall_fn_t)(uint64_t, uint64_t, uint64_t, syscall_frame_t*);
+
+#define SYSCALL_RETURN(val) ((syscall_result_t){ .value = (uint64_t)(val), .should_return = true })
+#define SYSCALL_NO_RETURN   ((syscall_result_t){ .value = 0, .should_return = false })
+
 // Copy a userspace timespec into kernel memory
 static bool copy_user_timespec(uint64_t user_ptr, k_timespec_t* out) {
     if (!out || !user_ptr) {
         return false;
     }
 
-    if (!is_userspace_ptr(user_ptr, sizeof(k_timespec_t))) {
-        return false;
-    }
-
-    k_timespec_t* user_ts = (k_timespec_t*)user_ptr;
-    out->tv_sec = user_ts->tv_sec;
-    out->tv_nsec = user_ts->tv_nsec;
-    return true;
+    return copy_from_user(user_ptr, out, sizeof(k_timespec_t));
 }
 
 // Write a timespec back to userspace (best-effort)
@@ -112,13 +148,8 @@ static void write_user_timespec_zero(uint64_t user_ptr) {
         return;
     }
 
-    if (!is_userspace_ptr(user_ptr, sizeof(k_timespec_t))) {
-        return;
-    }
-
-    k_timespec_t* user_ts = (k_timespec_t*)user_ptr;
-    user_ts->tv_sec = 0;
-    user_ts->tv_nsec = 0;
+    k_timespec_t zero = {0};
+    copy_to_user(user_ptr, &zero, sizeof(k_timespec_t));
 }
 
 // Convert a POSIX timespec into timer ticks (rounded up) with overflow checks
@@ -222,696 +253,607 @@ void syscall_on_process_exit(process_t* proc) {
 }
 
 // Syscall handler implementation
-void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
-    (void)arg2;
-    (void)arg3;
-    
+static syscall_result_t sys_print(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg2; (void)arg3; (void)frame;
     struct limine_framebuffer* fb = fb0();
-    
-    // Return value in RAX
-    uint64_t retval = 0;
-    
-    switch(syscall_num) {
-        case SYS_PRINT: {
-            size_t len;
-            if (arg1 && validate_user_string((const char*)arg1, &len)) {
-                print(fb, (const char*)arg1);
-                retval = len;
-            } else {
-                print(fb, "[invalid string pointer]\n");
-                retval = (uint64_t)-1;
-            }
-            break;
-        }
-
-        case SYS_GETPID: {
-            process_t* current = process_current();
-            if (current) {
-                retval = current->pid;
-            }
-            break;
-        }
-
-        case SYS_GETTIME: {
-            retval = timer_get_ticks();
-            break;
-        }
-
-        case SYS_SLEEP: { // POSIX nanosleep(req, rem)
-            process_t* current = process_current();
-            uint64_t freq = timer_get_frequency();
-
-            if (!current) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            k_timespec_t req;
-            bool have_rem = arg2 != 0;
-
-            if (!copy_user_timespec(arg1, &req)) {
-                set_errno(current, K_EFAULT);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            if (have_rem && !is_userspace_ptr(arg2, sizeof(k_timespec_t))) {
-                set_errno(current, K_EFAULT);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            uint64_t ticks = 0;
-            if (!timespec_to_ticks(&req, freq, &ticks)) {
-                set_errno(current, K_EINVAL);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            if (ticks == 0) {
-                if (have_rem) {
-                    write_user_timespec_zero(arg2);
-                }
-                retval = 0;
-                break;
-            }
-
-            uint64_t target = timer_get_ticks() + ticks;
-
-            if (scheduler_sleep_until((uint64_t*)frame, target)) {
-                if (have_rem) {
-                    write_user_timespec_zero(arg2);
-                }
-                return; // Resume after wake-up
-            }
-
-            if (have_rem) {
-                write_user_timespec_zero(arg2);
-            }
-            retval = 0;
-            break;
-        }
-
-        case SYS_YIELD: {
-            // Just return - the timer will switch us eventually
-            // For now, this is a no-op, but we could force a reschedule
-            retval = 0;
-            break;
-        }
-
-        case SYS_GETCHAR: {
-            // Block until a character is available
-            // For now, just call keyboard_getchar which blocks
-            char c = keyboard_getchar();
-            retval = (uint64_t)(unsigned char)c;
-            break;
-        }
-
-        case SYS_GETCHAR_NONBLOCKING: {
-            char c = keyboard_getchar_nonblocking();
-            if (c == -1) {
-                retval = (uint64_t)-1; // No char available
-            } else {
-                retval = (uint64_t)(unsigned char)c;
-            }
-            break;
-        }
-
-        case SYS_POLL: {
-            // Check if keyboard data is available
-            uint8_t status = inb(0x64);
-            retval = (status & 0x01) ? 1 : 0;
-            break;
-        }
-
-        case SYS_HDA_WRITE_PCM: {
-            const int16_t* user_samples = (const int16_t*)arg1;
-            size_t frames = (size_t)arg2;
-            size_t channels = HDA_output_channels();
-            size_t frame_bytes = channels * sizeof(int16_t);
-            uint64_t total_bytes = (uint64_t)frames * (uint64_t)frame_bytes;
-
-            if (frames == 0 || total_bytes == 0 || total_bytes > SIZE_MAX) {
-                retval = 0;
-                break;
-            }
-
-            if (!is_userspace_ptr(arg1, (size_t)total_bytes)) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            int16_t* tmp = (int16_t*)kmalloc((size_t)total_bytes);
-            if (!tmp) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            // Copy from userspace
-            size_t samples_to_copy = total_bytes / sizeof(int16_t);
-            for (size_t i = 0; i < samples_to_copy; ++i) {
-                tmp[i] = user_samples[i];
-            }
-
-            retval = HDA_enqueue_interleaved_pcm(tmp, frames);
-            kfree(tmp);
-            break;
-        }
-
-        
-
-        case SYS_FB_INFO: {
-            // arg1 = pointer to fb_info_t structure
-            if (!is_userspace_ptr(arg1, sizeof(fb_info_t))) {
-                retval = (uint64_t)-1;
-                break;
-            }
-            
-            fb_info_t* info = (fb_info_t*)arg1;
-            if (fb) {
-                info->address = (uint64_t)fb->address;
-                info->width = fb->width;
-                info->height = fb->height;
-                info->pitch = fb->pitch;
-                info->bpp = fb->bpp;
-                retval = 0;
-            } else {
-                retval = (uint64_t)-1;
-            }
-            break;
-        }
-
-        case SYS_FB_MAP: {
-            // Map framebuffer into process address space
-            // arg1 = desired virtual address (or 0 for auto)
-            // Returns: virtual address or -1
-            
-            if (!fb) {
-                retval = (uint64_t)-1;
-                break;
-            }
-            
-            process_t* proc = process_current();
-            if (!proc || !proc->page_table) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            if (proc->fb_mapping_size != 0) {
-                retval = proc->fb_mapping_virt_base;
-                break;
-            }
-            
-            // Calculate how many pages we need
-            uint64_t fb_size = fb->pitch * fb->height;
-            uint64_t pages_needed = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE;
-            
-            // Choose virtual address (simplified - use fixed address for now)
-            uint64_t virt_addr = 0x600000000000ULL;  // 6TB mark
-            
-            // Get physical address of framebuffer
-            // Limine gives us a virtual address in higher half, convert it
-            uint64_t fb_virt = (uint64_t)fb->address;
-            uint64_t fb_phys;
-            
-            // Check if it's already a higher-half address
-            uint64_t hhdm = hhdm_get_offset();
-            if (fb_virt >= hhdm) {
-                // It's in the higher half, convert to physical
-                fb_phys = fb_virt - hhdm;
-            } else {
-                // Assume it's already physical
-                fb_phys = fb_virt;
-            }
-            
-            // Map each page
-            bool success = true;
-            for (uint64_t i = 0; i < pages_needed; i++) {
-                uint64_t virt_page = virt_addr + (i * PAGE_SIZE);
-                uint64_t phys_page = fb_phys + (i * PAGE_SIZE);
-                
-                if (!vmm_map_page(proc->page_table, virt_page, phys_page,
-                                PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
-                    // Failed - unmap what we've done
-                    for (uint64_t j = 0; j < i; j++) {
-                        vmm_unmap_page(proc->page_table, virt_addr + (j * PAGE_SIZE));
-                    }
-                    success = false;
-                    break;
-                }
-            }
-            
-            if (success) {
-                uint64_t mapped_size = pages_needed * PAGE_SIZE;
-                proc->fb_mapping_phys_base = fb_phys;
-                proc->fb_mapping_size = mapped_size;
-                proc->fb_mapping_virt_base = virt_addr;
-                retval = virt_addr;
-            } else {
-                retval = (uint64_t)-1;
-            }
-            break;
-        }
-
-        case SYS_FB_FLIP: {
-            // No double buffering yet; succeed so callers don't crash.
-            retval = 0;
-            break;
-        }
-
-        case SYS_BRK: {
-            // arg1 = new heap end address (or 0 to query current)
-            // Returns: current/new heap end address
-
-            process_t* proc = process_current();
-            if (!proc) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            // If arg1 is 0, just return current heap end
-            if (arg1 == 0) {
-                retval = proc->heap_end;
-                break;
-            }
-
-            uint64_t new_end = arg1;
-
-            // Validate new end is in userspace and above heap start
-            uint64_t hhdm = hhdm_get_offset();
-            if (new_end >= hhdm || new_end < proc->heap_start) {
-                set_errno(proc, K_EINVAL);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            // Don't allow heap to grow past user stack (leave some space)
-            uint64_t max_heap = 0x500000000000ULL;  // 5TB mark (well below 8TB stack)
-            if (new_end > max_heap) {
-                set_errno(proc, K_ENOMEM);
-                retval = (uint64_t)-1;
-                break;
-            }
-            
-            // Calculate which pages we need
-            uint64_t old_end_page = PAGE_ALIGN_UP(proc->heap_end);
-            uint64_t new_end_page = PAGE_ALIGN_UP(new_end);
-            
-            if (new_end_page > old_end_page) {
-                // Growing heap - need to allocate and map new pages
-                uint64_t pages_needed = (new_end_page - old_end_page) / PAGE_SIZE;
-                bool grow_ok = true;
-                uint64_t pages_allocated = 0;
-
-                for (uint64_t i = 0; i < pages_needed; i++) {
-                    uint64_t virt_addr = old_end_page + (i * PAGE_SIZE);
-                    uint64_t phys_page = (uint64_t)pmm_alloc();
-
-                    if (!phys_page) {
-                        grow_ok = false;
-                        break;
-                    }
-
-                    if (!vmm_map_page(proc->page_table, virt_addr, phys_page,
-                                    PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
-                        // Mapping failed - free the page and return
-                        pmm_free((void*)phys_page);
-                        grow_ok = false;
-                        break;
-                    }
-
-                    // Zero out the new page
-                    uint8_t* page_virt = (uint8_t*)phys_to_virt(phys_page);
-                    memset(page_virt, 0, PAGE_SIZE);
-
-                    pages_allocated++;
-                }
-
-                if (!grow_ok) {
-                    for (uint64_t j = 0; j < pages_allocated; j++) {
-                        uint64_t virt_addr = old_end_page + (j * PAGE_SIZE);
-                        uint64_t phys = vmm_get_physical(proc->page_table, virt_addr);
-                        if (phys) {
-                            vmm_unmap_page(proc->page_table, virt_addr);
-                            pmm_free((void*)phys);
-                        }
-                    }
-
-                    set_errno(proc, K_ENOMEM);
-                    retval = (uint64_t)-1;
-                    break;
-                }
-
-                // Update heap end
-                proc->heap_end = new_end;
-                retval = 0;
-
-            } else if (new_end_page < old_end_page) {
-                // Shrinking heap - unmap pages
-                uint64_t pages_to_free = (old_end_page - new_end_page) / PAGE_SIZE;
-
-                for (uint64_t i = 0; i < pages_to_free; i++) {
-                    uint64_t virt_addr = new_end_page + (i * PAGE_SIZE);
-                    uint64_t phys_addr = vmm_get_physical(proc->page_table, virt_addr);
-                    
-                    if (phys_addr) {
-                        vmm_unmap_page(proc->page_table, virt_addr);
-                        pmm_free((void*)phys_addr);
-                    }
-                }
-
-                proc->heap_end = new_end;
-                retval = 0;
-
-            } else {
-                // No page boundary crossed, just update pointer
-                proc->heap_end = new_end;
-                retval = 0;
-            }
-
-            break;
-        }
-
-        case SYS_MMAP: {
-            process_t* proc = process_current();
-            uint64_t virt_addr = arg1;
-            uint64_t length = arg2;
-            uint64_t prot = arg3;
-            uint64_t flags = frame->rsi;
-            int fd = (int)frame->rdi;
-            uint64_t offset = frame->r8;
-
-            if (!proc || !proc->page_table || length == 0) {
-                set_errno(proc, K_EINVAL);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            bool want_shared = (flags & MAP_SHARED) != 0;
-            bool want_private = (flags & MAP_PRIVATE) != 0;
-            bool map_fixed = (flags & MAP_FIXED) != 0;
-            bool anonymous = (flags & MAP_ANONYMOUS) != 0;
-
-            if (want_shared == want_private) {
-                set_errno(proc, K_EINVAL);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
-            uint64_t aligned_length = pages * PAGE_SIZE;
-
-            if (map_fixed) {
-                if (virt_addr == 0 || (virt_addr & (PAGE_SIZE - 1))) {
-                    set_errno(proc, K_EINVAL);
-                    retval = (uint64_t)-1;
-                    break;
-                }
-            }
-
-            if (virt_addr != 0) {
-                virt_addr &= ~(PAGE_SIZE - 1);
-            }
-
-            uint64_t search_base = PAGE_ALIGN_UP(proc->heap_end);
-            if (search_base < 0x40000000000ULL) {
-                search_base = 0x40000000000ULL;
-            }
-
-            if (!map_fixed) {
-                if (virt_addr && !range_is_free(proc, virt_addr, pages)) {
-                    virt_addr = find_free_range(proc, virt_addr + PAGE_SIZE, pages);
-                }
-
-                if (virt_addr == 0 || !range_is_free(proc, virt_addr, pages)) {
-                    virt_addr = find_free_range(proc, search_base, pages);
-                }
-
-                if (virt_addr == 0) {
-                    set_errno(proc, K_ENOMEM);
-                    retval = (uint64_t)-1;
-                    break;
-                }
-            } else {
-                if (!range_is_free(proc, virt_addr, pages)) {
-                    set_errno(proc, K_EINVAL);
-                    retval = (uint64_t)-1;
-                    break;
-                }
-            }
-
-            if (!is_userspace_ptr(virt_addr, aligned_length)) {
-                set_errno(proc, K_EFAULT);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            const uint8_t* file_bytes = NULL;
-            size_t file_size = 0;
-
-            if (!anonymous) {
-                if (fd < 0 || (size_t)fd >= PROCESS_MAX_FDS || !proc->fd_table[fd].in_use) {
-                    set_errno(proc, K_EBADF);
-                    retval = (uint64_t)-1;
-                    break;
-                }
-
-                fd_entry_t* entry = &proc->fd_table[fd];
-
-                if (offset > entry->size) {
-                    set_errno(proc, K_EINVAL);
-                    retval = (uint64_t)-1;
-                    break;
-                }
-
-                file_bytes = (const uint8_t*)entry->data;
-                file_size = entry->size;
-            }
-
-            uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
-            if (prot & PROT_WRITE) {
-                page_flags |= PAGE_WRITE;
-            }
-
-            bool ok = true;
-            uint64_t mapped = 0;
-
-            for (uint64_t i = 0; i < pages; i++) {
-                uint64_t va = virt_addr + (i * PAGE_SIZE);
-                void* phys = pmm_alloc();
-
-                if (!phys) {
-                    set_errno(proc, K_ENOMEM);
-                    ok = false;
-                    break;
-                }
-
-                if (!vmm_map_page(proc->page_table, va, (uint64_t)phys, page_flags)) {
-                    pmm_free(phys);
-                    set_errno(proc, K_ENOMEM);
-                    ok = false;
-                    break;
-                }
-
-                uint8_t* pv = (uint8_t*)phys_to_virt((uint64_t)phys);
-                size_t copied = 0;
-
-                if (!anonymous && file_bytes) {
-                    size_t page_offset = i * PAGE_SIZE;
-
-                    if (offset + page_offset < file_size) {
-                        size_t remaining = file_size - (offset + page_offset);
-                        copied = remaining > PAGE_SIZE ? PAGE_SIZE : remaining;
-                        memcpy(pv, file_bytes + offset + page_offset, copied);
-                    }
-                }
-
-                if (copied < PAGE_SIZE) {
-                    memset(pv + copied, 0, PAGE_SIZE - copied);
-                }
-
-                mapped++;
-            }
-
-            if (!ok) {
-                for (uint64_t i = 0; i < mapped; i++) {
-                    uint64_t va = virt_addr + (i * PAGE_SIZE);
-                    uint64_t phys = vmm_get_physical(proc->page_table, va);
-                    if (phys) {
-                        vmm_unmap_page(proc->page_table, va);
-                        pmm_free((void*)phys);
-                    }
-                }
-
-                retval = (uint64_t)-1;
-
-            } else {
-                retval = virt_addr;
-            }
-            break;
-        }
-
-        case SYS_MUNMAP: {
-            process_t* proc = process_current();
-            uint64_t virt_addr = arg1;
-            uint64_t length = arg2;
-
-            if (!proc || !proc->page_table || length == 0) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            if (!is_userspace_ptr(virt_addr, length)) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            uint64_t base = virt_addr & ~(PAGE_SIZE - 1);
-            uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
-
-            for (uint64_t i = 0; i < pages; i++) {
-                uint64_t va = base + (i * PAGE_SIZE);
-                uint64_t phys = vmm_get_physical(proc->page_table, va);
-
-                if (phys) {
-                    bool is_fb = proc->fb_mapping_size &&
-                                 phys >= proc->fb_mapping_phys_base &&
-                                 phys < proc->fb_mapping_phys_base + proc->fb_mapping_size;
-
-                    vmm_unmap_page(proc->page_table, va);
-                    if (!is_fb) {
-                        pmm_free((void*)phys);
-                    }
-                }
-            }
-
-            retval = 0;
-            break;
-        }
-
-        case SYS_EXIT: {
-            process_t* current = process_current();
-
-            if (current) {
-                // Close all file descriptors for this process
-                fd_close_all_for_process(current);
-                
-                current->state = PROCESS_TERMINATED;
-                print(fb, "\nProcess ");
-                print(fb, current->name);
-                print(fb, " exited with code ");
-                print_hex(fb, arg1);
-                print(fb, "\n");
-            }
-
-            process_cleanup_terminated();
-
-            if (scheduler_reschedule((uint64_t*)frame)) {
-                return;
-            }
-
-            // No other usermode processes
-            print(fb, "All processes finished\n");
-
-            // Fall back to the idle thread (or halt) instead of returning
-            // to a terminated userspace process.
-            process_t* idle = process_find_idle();
-            if (idle && idle != current) {
-                if (idle->state != PROCESS_READY && idle->state != PROCESS_RUNNING) {
-                    idle->state = PROCESS_READY;
-                }
-
-                process_switch_to(idle);
-            }
-
-            // If we couldn't find anything runnable, halt cleanly.
-            asm volatile("cli; hlt");
-
-            break;
-        }
-
-        case SYS_GETTICKS: {
-            retval = timer_get_ticks();
-            break;
-        }
-
-        case SYS_SLEEP_MS: {
-            uint64_t ms = arg1;
-            uint64_t freq = timer_get_frequency();
-            process_t* current = process_current();
-            uint64_t ticks = 0;
-
-            if (!current || !ms_to_ticks(ms, freq, &ticks)) {
-                set_errno(current, K_EINVAL);
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            uint64_t target = timer_get_ticks() + ticks;
-
-            if (scheduler_sleep_until((uint64_t*)frame, target)) {
-                return;
-            }
-
-            retval = 0;
-            break;
-        }
-
-        case SYS_SLEEP_TICKS: {
-            uint64_t ticks = arg1;
-            process_t* current = process_current();
-
-            if (!current) {
-                retval = (uint64_t)-1;
-                break;
-            }
-
-            uint64_t target = timer_get_ticks() + ticks;
-
-            if (scheduler_sleep_until((uint64_t*)frame, target)) {
-                return;
-            }
-
-            retval = 0;
-            break;
-        }
-
-        case SYS_GETTICKS_DELTA: {
-            process_t* current = process_current();
-            if (current) {
-                retval = timer_get_ticks() - current->start_ticks;
-            } else {
-                retval = 0;
-            }
-            break;
-        }
-
-        case SYS_RAND: {
-            // Simple LFSR for random number generation
-            static uint32_t lfsr = 0xACE1u;
-            lfsr ^= lfsr << 13;
-            lfsr ^= lfsr >> 17;
-            lfsr ^= lfsr << 5;
-            retval = (uint64_t)lfsr;
-            break;
-        }
-
-        case SYS_REBOOT:
-            acpi_reboot();            // no-return
-            break;
-
-        case SYS_SHUTDOWN:
-            acpi_poweroff();          // no-return
-            break;
-            
-        default:
-            print(fb, "[invalid syscall number]\n");
-            retval = (uint64_t)-1;
-            break;
+    size_t len;
+    if (arg1 && validate_user_string((const char*)arg1, &len)) {
+        print(fb, (const char*)arg1);
+        return SYSCALL_RETURN(len);
     }
-    
-    // Set return value in RAX
-    frame->rax = retval;
+
+    print(fb, "[invalid string pointer]\n");
+    return SYSCALL_RETURN((uint64_t)-1);
+}
+
+static syscall_result_t sys_getpid(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    process_t* current = process_current();
+    if (current) {
+        return SYSCALL_RETURN(current->pid);
+    }
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_gettime(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    return SYSCALL_RETURN(timer_get_ticks());
+}
+
+static syscall_result_t sys_sleep(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg3;
+    process_t* current = process_current();
+    uint64_t freq = timer_get_frequency();
+
+    if (!current) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    k_timespec_t req;
+    bool have_rem = arg2 != 0;
+
+    if (!copy_user_timespec(arg1, &req)) {
+        set_errno(current, K_EFAULT);
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    if (have_rem && !is_userspace_ptr(arg2, sizeof(k_timespec_t))) {
+        set_errno(current, K_EFAULT);
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t ticks = 0;
+    if (!timespec_to_ticks(&req, freq, &ticks)) {
+        set_errno(current, K_EINVAL);
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    if (ticks == 0) {
+        if (have_rem) {
+            write_user_timespec_zero(arg2);
+        }
+        return SYSCALL_RETURN(0);
+    }
+
+    uint64_t target = timer_get_ticks() + ticks;
+
+    if (scheduler_sleep_until((uint64_t*)frame, target)) {
+        if (have_rem) {
+            write_user_timespec_zero(arg2);
+        }
+        return SYSCALL_NO_RETURN;
+    }
+
+    if (have_rem) {
+        write_user_timespec_zero(arg2);
+    }
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_getchar(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    char c = keyboard_getchar();
+    return SYSCALL_RETURN((uint64_t)(unsigned char)c);
+}
+
+static syscall_result_t sys_getchar_nonblocking(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    char c = keyboard_getchar_nonblocking();
+    if (c == -1) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+    return SYSCALL_RETURN((uint64_t)(unsigned char)c);
+}
+
+static syscall_result_t sys_poll(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    uint8_t status = inb(0x64);
+    return SYSCALL_RETURN((status & 0x01) ? 1 : 0);
+}
+
+static syscall_result_t sys_hda_write_pcm_handler(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg3; (void)frame;
+    const int16_t* user_samples = (const int16_t*)arg1;
+    size_t frames = (size_t)arg2;
+    size_t channels = HDA_output_channels();
+    size_t frame_bytes = channels * sizeof(int16_t);
+    uint64_t total_bytes = (uint64_t)frames * (uint64_t)frame_bytes;
+
+    if (frames == 0 || total_bytes == 0 || total_bytes > SIZE_MAX) {
+        return SYSCALL_RETURN(0);
+    }
+
+    if (!is_userspace_ptr(arg1, (size_t)total_bytes)) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    int16_t* tmp = (int16_t*)kmalloc((size_t)total_bytes);
+    if (!tmp) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    size_t samples_to_copy = total_bytes / sizeof(int16_t);
+    for (size_t i = 0; i < samples_to_copy; ++i) {
+        tmp[i] = user_samples[i];
+    }
+
+    uint64_t ret = HDA_enqueue_interleaved_pcm(tmp, frames);
+    kfree(tmp);
+    return SYSCALL_RETURN(ret);
+}
+
+static syscall_result_t sys_fb_info(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg2; (void)arg3; (void)frame;
+    struct limine_framebuffer* fb = fb0();
+    fb_info_t info = {0};
+
+    if (!fb || !copy_from_user(arg1, &info, sizeof(fb_info_t))) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    info.address = (uint64_t)fb->address;
+    info.width = fb->width;
+    info.height = fb->height;
+    info.pitch = fb->pitch;
+    info.bpp = fb->bpp;
+
+    if (!copy_to_user(arg1, &info, sizeof(fb_info_t))) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_fb_map(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    struct limine_framebuffer* fb = fb0();
+    if (!fb) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    process_t* proc = process_current();
+    if (!proc || !proc->page_table) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    if (proc->fb_mapping_size != 0) {
+        return SYSCALL_RETURN(proc->fb_mapping_virt_base);
+    }
+
+    uint64_t fb_size = fb->pitch * fb->height;
+    uint64_t pages_needed = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t virt_addr = 0x600000000000ULL;
+
+    uint64_t fb_virt = (uint64_t)fb->address;
+    uint64_t fb_phys;
+
+    uint64_t hhdm = hhdm_get_offset();
+    if (fb_virt >= hhdm) {
+        fb_phys = fb_virt - hhdm;
+    } else {
+        fb_phys = fb_virt;
+    }
+
+    bool success = true;
+    for (uint64_t i = 0; i < pages_needed; i++) {
+        uint64_t virt_page = virt_addr + (i * PAGE_SIZE);
+        uint64_t phys_page = fb_phys + (i * PAGE_SIZE);
+
+        if (!vmm_map_page(proc->page_table, virt_page, phys_page,
+                          PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
+            for (uint64_t j = 0; j < i; j++) {
+                vmm_unmap_page(proc->page_table, virt_addr + (j * PAGE_SIZE));
+            }
+            success = false;
+            break;
+        }
+    }
+
+    if (success) {
+        uint64_t mapped_size = pages_needed * PAGE_SIZE;
+        proc->fb_mapping_phys_base = fb_phys;
+        proc->fb_mapping_size = mapped_size;
+        proc->fb_mapping_virt_base = virt_addr;
+        return SYSCALL_RETURN(virt_addr);
+    }
+
+    return SYSCALL_RETURN((uint64_t)-1);
+}
+
+static syscall_result_t sys_fb_flip(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_brk(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg2; (void)arg3; (void)frame;
+    process_t* proc = process_current();
+    if (!proc) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    if (arg1 == 0) {
+        return SYSCALL_RETURN(proc->heap_end);
+    }
+
+    uint64_t new_end = arg1;
+    uint64_t hhdm = hhdm_get_offset();
+    if (new_end >= hhdm || new_end < proc->heap_start) {
+        set_errno(proc, K_EINVAL);
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t max_heap = 0x500000000000ULL;
+    if (new_end > max_heap) {
+        set_errno(proc, K_ENOMEM);
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t old_end_page = PAGE_ALIGN_UP(proc->heap_end);
+    uint64_t new_end_page = PAGE_ALIGN_UP(new_end);
+
+    if (new_end_page > old_end_page) {
+        uint64_t pages_needed = (new_end_page - old_end_page) / PAGE_SIZE;
+        uint64_t current_page = old_end_page;
+
+        for (uint64_t i = 0; i < pages_needed; i++) {
+            void* phys = pmm_alloc();
+            if (!phys) {
+                set_errno(proc, K_ENOMEM);
+                return SYSCALL_RETURN((uint64_t)-1);
+            }
+
+            if (!vmm_map_page(proc->page_table, current_page, (uint64_t)phys,
+                              PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
+                pmm_free(phys);
+                set_errno(proc, K_ENOMEM);
+                return SYSCALL_RETURN((uint64_t)-1);
+            }
+
+            memset(phys_to_virt((uint64_t)phys), 0, PAGE_SIZE);
+            current_page += PAGE_SIZE;
+        }
+    } else if (new_end_page < old_end_page) {
+        uint64_t pages_to_free = (old_end_page - new_end_page) / PAGE_SIZE;
+        uint64_t current_page = new_end_page;
+
+        for (uint64_t i = 0; i < pages_to_free; i++) {
+            uint64_t phys = vmm_get_physical(proc->page_table, current_page);
+            if (phys) {
+                vmm_unmap_page(proc->page_table, current_page);
+                pmm_free((void*)phys);
+            }
+            current_page += PAGE_SIZE;
+        }
+    }
+
+    proc->heap_end = new_end;
+    return SYSCALL_RETURN(proc->heap_end);
+}
+
+static syscall_result_t sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)frame;
+    process_t* proc = process_current();
+    uint64_t length = arg2;
+    int prot = (int)(arg3 & 0xFFFFFFFF);
+    int flags = (int)(arg3 >> 32);
+
+    if (!proc || !proc->page_table || length == 0) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t virt_addr = arg1;
+    bool fixed = flags & MAP_FIXED;
+    bool anonymous = flags & MAP_ANON;
+
+    if (virt_addr == 0) {
+        virt_addr = find_free_range(proc, 0x10000000000ULL, pages);
+        if (virt_addr == 0) {
+            return SYSCALL_RETURN((uint64_t)-1);
+        }
+    } else {
+        if (!is_userspace_ptr(virt_addr, length)) {
+            return SYSCALL_RETURN((uint64_t)-1);
+        }
+        virt_addr = PAGE_ALIGN_DOWN(virt_addr);
+    }
+
+    if (!fixed) {
+        uint64_t candidate = find_free_range(proc, virt_addr, pages);
+        if (candidate == 0) {
+            return SYSCALL_RETURN((uint64_t)-1);
+        }
+        virt_addr = candidate;
+    } else {
+        if (!range_is_free(proc, virt_addr, pages)) {
+            return SYSCALL_RETURN((uint64_t)-1);
+        }
+    }
+
+    const uint8_t* file_bytes = NULL;
+    size_t file_size = 0;
+    size_t offset = 0;
+
+    if (!anonymous) {
+        int fd = (int)prot;
+
+        if (fd < 0 || fd >= (int)PROCESS_MAX_FDS || !proc->fd_table[fd].in_use) {
+            set_errno(proc, K_EBADF);
+            return SYSCALL_RETURN((uint64_t)-1);
+        }
+
+        fd_entry_t* entry = &proc->fd_table[fd];
+
+        if (offset > entry->size) {
+            set_errno(proc, K_EINVAL);
+            return SYSCALL_RETURN((uint64_t)-1);
+        }
+
+        file_bytes = (const uint8_t*)entry->data;
+        file_size = entry->size;
+    }
+
+    uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
+    if (prot & PROT_WRITE) {
+        page_flags |= PAGE_WRITE;
+    }
+
+    bool ok = true;
+    uint64_t mapped = 0;
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t va = virt_addr + (i * PAGE_SIZE);
+        void* phys = pmm_alloc();
+
+        if (!phys) {
+            set_errno(proc, K_ENOMEM);
+            ok = false;
+            break;
+        }
+
+        if (!vmm_map_page(proc->page_table, va, (uint64_t)phys, page_flags)) {
+            pmm_free(phys);
+            set_errno(proc, K_ENOMEM);
+            ok = false;
+            break;
+        }
+
+        uint8_t* pv = (uint8_t*)phys_to_virt((uint64_t)phys);
+        size_t copied = 0;
+
+        if (!anonymous && file_bytes) {
+            size_t page_offset = i * PAGE_SIZE;
+
+            if (offset + page_offset < file_size) {
+                size_t remaining = file_size - (offset + page_offset);
+                copied = remaining > PAGE_SIZE ? PAGE_SIZE : remaining;
+                memcpy(pv, file_bytes + offset + page_offset, copied);
+            }
+        }
+
+        if (copied < PAGE_SIZE) {
+            memset(pv + copied, 0, PAGE_SIZE - copied);
+        }
+
+        mapped++;
+    }
+
+    if (!ok) {
+        for (uint64_t i = 0; i < mapped; i++) {
+            uint64_t va = virt_addr + (i * PAGE_SIZE);
+            uint64_t phys = vmm_get_physical(proc->page_table, va);
+            if (phys) {
+                vmm_unmap_page(proc->page_table, va);
+                pmm_free((void*)phys);
+            }
+        }
+
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    return SYSCALL_RETURN(virt_addr);
+}
+
+static syscall_result_t sys_munmap(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg3; (void)frame;
+    process_t* proc = process_current();
+    uint64_t virt_addr = arg1;
+    uint64_t length = arg2;
+
+    if (!proc || !proc->page_table || length == 0) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    if (!is_userspace_ptr(virt_addr, length)) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t base = virt_addr & ~(PAGE_SIZE - 1);
+    uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t va = base + (i * PAGE_SIZE);
+        uint64_t phys = vmm_get_physical(proc->page_table, va);
+
+        if (phys) {
+            bool is_fb = proc->fb_mapping_size &&
+                         phys >= proc->fb_mapping_phys_base &&
+                         phys < proc->fb_mapping_phys_base + proc->fb_mapping_size;
+
+            vmm_unmap_page(proc->page_table, va);
+            if (!is_fb) {
+                pmm_free((void*)phys);
+            }
+        }
+    }
+
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_exit(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg2; (void)arg3;
+    struct limine_framebuffer* fb = fb0();
+    process_t* current = process_current();
+
+    if (current) {
+        fd_close_all_for_process(current);
+
+        current->state = PROCESS_TERMINATED;
+        print(fb, "\nProcess ");
+        print(fb, current->name);
+        print(fb, " exited with code ");
+        print_hex(fb, arg1);
+        print(fb, "\n");
+    }
+
+    process_cleanup_terminated();
+
+    if (scheduler_reschedule((uint64_t*)frame)) {
+        return SYSCALL_NO_RETURN;
+    }
+
+    print(fb, "All processes finished\n");
+
+    process_t* idle = process_find_idle();
+    if (idle && idle != current) {
+        if (idle->state != PROCESS_READY && idle->state != PROCESS_RUNNING) {
+            idle->state = PROCESS_READY;
+        }
+
+        process_switch_to(idle);
+    }
+
+    asm volatile("cli; hlt");
+    return SYSCALL_NO_RETURN;
+}
+
+static syscall_result_t sys_getticks(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    return SYSCALL_RETURN(timer_get_ticks());
+}
+
+static syscall_result_t sys_sleep_ms(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg2; (void)arg3;
+    uint64_t ms = arg1;
+    uint64_t freq = timer_get_frequency();
+    process_t* current = process_current();
+    uint64_t ticks = 0;
+
+    if (!current || !ms_to_ticks(ms, freq, &ticks)) {
+        set_errno(current, K_EINVAL);
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t target = timer_get_ticks() + ticks;
+
+    if (scheduler_sleep_until((uint64_t*)frame, target)) {
+        return SYSCALL_NO_RETURN;
+    }
+
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_sleep_ticks(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg2; (void)arg3;
+    uint64_t ticks = arg1;
+    process_t* current = process_current();
+
+    if (!current) {
+        return SYSCALL_RETURN((uint64_t)-1);
+    }
+
+    uint64_t target = timer_get_ticks() + ticks;
+
+    if (scheduler_sleep_until((uint64_t*)frame, target)) {
+        return SYSCALL_NO_RETURN;
+    }
+
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_getticks_delta(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    process_t* current = process_current();
+    if (current) {
+        return SYSCALL_RETURN(timer_get_ticks() - current->start_ticks);
+    }
+    return SYSCALL_RETURN(0);
+}
+
+static syscall_result_t sys_rand(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    static uint32_t lfsr = 0xACE1u;
+    lfsr ^= lfsr << 13;
+    lfsr ^= lfsr >> 17;
+    lfsr ^= lfsr << 5;
+    return SYSCALL_RETURN((uint64_t)lfsr);
+}
+
+static syscall_result_t sys_reboot(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    acpi_reboot();
+    return SYSCALL_NO_RETURN;
+}
+
+static syscall_result_t sys_shutdown(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    (void)arg1; (void)arg2; (void)arg3; (void)frame;
+    acpi_poweroff();
+    return SYSCALL_NO_RETURN;
+}
+
+typedef struct {
+    const char* name;
+    syscall_fn_t fn;
+} syscall_entry_t;
+
+#define SYSCALL_TABLE_SIZE 71
+
+static const syscall_entry_t syscall_table[SYSCALL_TABLE_SIZE] = {
+    [SYS_EXIT] = { "exit", sys_exit },
+    [SYS_PRINT] = { "print", sys_print },
+    [SYS_GETPID] = { "getpid", sys_getpid },
+    [SYS_GETTIME] = { "gettime", sys_gettime },
+    [SYS_SLEEP] = { "sleep", sys_sleep },
+    [SYS_YIELD] = { "yield", sys_yield },
+    [SYS_MMAP] = { "mmap", sys_mmap },
+    [SYS_MUNMAP] = { "munmap", sys_munmap },
+    [SYS_BRK] = { "brk", sys_brk },
+    [SYS_GETCHAR] = { "getchar", sys_getchar },
+    [SYS_GETCHAR_NONBLOCKING] = { "getchar_nonblocking", sys_getchar_nonblocking },
+    [SYS_POLL] = { "poll", sys_poll },
+    [SYS_FB_INFO] = { "fb_info", sys_fb_info },
+    [SYS_FB_MAP] = { "fb_map", sys_fb_map },
+    [SYS_FB_FLIP] = { "fb_flip", sys_fb_flip },
+    [SYS_GETTICKS] = { "getticks", sys_getticks },
+    [SYS_SLEEP_MS] = { "sleep_ms", sys_sleep_ms },
+    [SYS_SLEEP_TICKS] = { "sleep_ticks", sys_sleep_ticks },
+    [SYS_GETTICKS_DELTA] = { "getticks_delta", sys_getticks_delta },
+    [SYS_RAND] = { "rand", sys_rand },
+    [SYS_REBOOT] = { "reboot", sys_reboot },
+    [SYS_SHUTDOWN] = { "shutdown", sys_shutdown },
+    [SYS_HDA_WRITE_PCM] = { "hda_write_pcm", sys_hda_write_pcm_handler },
+};
+
+void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
+    struct limine_framebuffer* fb = fb0();
+
+    syscall_result_t result = { .value = (uint64_t)-1, .should_return = true };
+
+    if (syscall_num < SYSCALL_TABLE_SIZE && syscall_table[syscall_num].fn) {
+        result = syscall_table[syscall_num].fn(arg1, arg2, arg3, frame);
+    } else {
+        print(fb, "[invalid syscall number]\n");
+    }
+
+    if (result.should_return) {
+        frame->rax = result.value;
+    }
 }
 
 // Low-level syscall handler
