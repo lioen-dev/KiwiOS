@@ -73,6 +73,11 @@ typedef struct process {
 
     uint64_t start_ticks;                  // Ticks at process start (for timing)
 
+    // Scheduling attributes
+    int priority;                          // Higher value = higher priority
+    uint32_t time_slice_ticks;             // Base time slice in timer ticks
+    uint32_t time_slice_remaining;         // Remaining ticks in current slice
+
     uint64_t sleep_until;                  // Target tick to wake from sleep
     bool sleep_interrupted;                // True if a sleep was cut short
     struct process* sleep_next;            // Linked-list node for sleep queue

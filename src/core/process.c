@@ -88,6 +88,9 @@ void process_init_common(process_t* proc, const char* name, uint32_t pid,
     proc->has_been_interrupted = false;
     proc->uses_linux_abi = false;
     proc->start_ticks = timer_get_ticks();
+    proc->priority = SCHED_DEFAULT_PRIORITY;
+    proc->time_slice_ticks = SCHED_DEFAULT_TIMESLICE_TICKS;
+    proc->time_slice_remaining = proc->time_slice_ticks;
     proc->parent = parent;
     proc->exit_status = 0;
 
@@ -169,6 +172,9 @@ void process_init(void) {
     if (!idle) return;
 
     idle->state = PROCESS_RUNNING;
+    idle->priority = SCHED_IDLE_PRIORITY;
+    idle->time_slice_ticks = SCHED_DEFAULT_TIMESLICE_TICKS;
+    idle->time_slice_remaining = idle->time_slice_ticks;
     idle->has_been_interrupted = true; // We pretend idle already ran so we can switch to it safely
 
     current_process = idle;
