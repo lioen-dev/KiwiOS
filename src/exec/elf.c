@@ -87,25 +87,8 @@ process_t* elf_load(const char* name, void* elf_data, size_t size) {
     // Create a new process
     process_t* proc = (process_t*)kmalloc(sizeof(process_t));
     if (!proc) return NULL;
-    
-    memset(proc, 0, sizeof(process_t));
-    
-    // Set up process info
-    static uint32_t next_pid = 100; // Start user processes at 100
-    proc->pid = next_pid++;
-    proc->state = PROCESS_READY;
-    proc->is_usermode = true;
-    proc->has_been_interrupted = false;
-    
-    // Copy name
-    if (name) {
-        int i = 0;
-        while (name[i] && i < 63) {
-            proc->name[i] = name[i];
-            i++;
-        }
-        proc->name[i] = '\0';
-    }
+
+    process_init_common(proc, name, process_alloc_pid(), true, process_current());
     
     // Allocate kernel stack
     uint64_t stack_phys = (uint64_t)pmm_alloc_pages(2);
@@ -309,9 +292,7 @@ process_t* elf_load(const char* name, void* elf_data, size_t size) {
     proc->interrupt_context.ss = 0x23;              // User data segment (ring 3)
     
     // Add to process list
-    extern process_t* process_list_head;
-    proc->next = process_list_head;
-    process_list_head = proc;
+    process_register(proc);
 
     return proc;
 }
