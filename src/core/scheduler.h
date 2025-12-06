@@ -6,6 +6,10 @@
 
 struct process;
 
+#define SCHED_DEFAULT_PRIORITY 1
+#define SCHED_IDLE_PRIORITY    (-1)
+#define SCHED_DEFAULT_TIMESLICE_TICKS 4
+
 void scheduler_init(void);
 
 // Force a reschedule using the provided interrupt stack frame. The frame layout

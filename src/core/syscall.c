@@ -21,6 +21,7 @@
 #define K_EFAULT 14
 #define K_ENOMEM 12
 #define K_EBADF   9
+#define K_ENOSYS 38
 
 extern struct limine_framebuffer* fb0(void);
 extern void print(struct limine_framebuffer* fb, const char* s);
@@ -105,23 +106,11 @@ static bool copy_to_user(uint64_t user_ptr, const void* src, size_t len) {
     return true;
 }
 
-// Full register frame
 typedef struct {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t rip, cs, rflags, rsp, ss;
 } syscall_frame_t;
-
-static void set_errno(process_t* proc, int err) {
-    if (proc) {
-        proc->last_errno = err;
-    }
-}
-
-typedef struct {
-    int64_t tv_sec;
-    int64_t tv_nsec;
-} k_timespec_t;
 
 typedef struct {
     uint64_t value;
@@ -132,6 +121,203 @@ typedef syscall_result_t (*syscall_fn_t)(uint64_t, uint64_t, uint64_t, syscall_f
 
 #define SYSCALL_RETURN(val) ((syscall_result_t){ .value = (uint64_t)(val), .should_return = true })
 #define SYSCALL_NO_RETURN   ((syscall_result_t){ .value = 0, .should_return = false })
+
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} k_timespec_t;
+
+// Forward declarations for helpers used by Linux compatibility path
+static void fd_close_all_for_process(process_t* proc);
+static bool copy_user_timespec(uint64_t user_ptr, k_timespec_t* out);
+static void write_user_timespec_zero(uint64_t user_ptr);
+static bool timespec_to_ticks(const k_timespec_t* ts, uint64_t freq, uint64_t* out_ticks);
+static syscall_result_t sys_brk(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame);
+static syscall_result_t sys_mmap(uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame);
+
+static inline syscall_result_t linux_error(int err) {
+    return SYSCALL_RETURN((uint64_t)(-err));
+}
+
+static inline syscall_result_t linux_ok(uint64_t val) {
+    return SYSCALL_RETURN(val);
+}
+
+// ---------------- Linux ABI helpers ----------------
+static syscall_result_t linux_sys_write(int fd, uint64_t buf, uint64_t count) {
+    struct limine_framebuffer* fb = fb0();
+
+    if (count == 0) {
+        return linux_ok(0);
+    }
+
+    if (!fb) {
+        return linux_error(K_ENOSYS);
+    }
+
+    if (!validate_user_buffer(buf, (size_t)count)) {
+        return linux_error(K_EFAULT);
+    }
+
+    size_t len = (size_t)count;
+    char* tmp = (char*)kmalloc(len);
+    if (!tmp) {
+        return linux_error(K_ENOMEM);
+    }
+
+    if (!copy_from_user(buf, tmp, len)) {
+        kfree(tmp);
+        return linux_error(K_EFAULT);
+    }
+
+    // Only support stdout/stderr for now
+    if (fd == 1 || fd == 2) {
+        for (size_t i = 0; i < len; i++) {
+            putc_fb(fb, tmp[i]);
+        }
+        kfree(tmp);
+        return linux_ok(count);
+    }
+
+    kfree(tmp);
+    return linux_error(K_EBADF);
+}
+
+static syscall_result_t linux_sys_exit(int status, syscall_frame_t* frame) {
+    (void)frame;
+    process_t* current = process_current();
+    if (current) {
+        fd_close_all_for_process(current);
+        process_exit(status);
+    }
+
+    process_cleanup_terminated();
+
+    if (scheduler_reschedule((uint64_t*)frame)) {
+        return SYSCALL_NO_RETURN;
+    }
+
+    process_t* idle = process_find_idle();
+    if (idle && idle != current) {
+        if (idle->state != PROCESS_READY && idle->state != PROCESS_RUNNING) {
+            idle->state = PROCESS_READY;
+        }
+        process_switch_to(idle);
+    }
+
+    asm volatile("cli; hlt");
+    return SYSCALL_NO_RETURN;
+}
+
+static syscall_result_t linux_sys_getpid(void) {
+    process_t* current = process_current();
+    if (!current) {
+        return linux_ok(0);
+    }
+    return linux_ok(current->pid);
+}
+
+static syscall_result_t linux_sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr,
+                                            syscall_frame_t* frame) {
+    process_t* current = process_current();
+    uint64_t freq = timer_get_frequency();
+
+    if (!current) {
+        return linux_error(K_EINVAL);
+    }
+
+    k_timespec_t req;
+    bool have_rem = rem_ptr != 0;
+
+    if (!copy_user_timespec(req_ptr, &req)) {
+        return linux_error(K_EFAULT);
+    }
+
+    if (have_rem && !is_userspace_ptr(rem_ptr, sizeof(k_timespec_t))) {
+        return linux_error(K_EFAULT);
+    }
+
+    uint64_t ticks = 0;
+    if (!timespec_to_ticks(&req, freq, &ticks)) {
+        return linux_error(K_EINVAL);
+    }
+
+    if (ticks == 0) {
+        if (have_rem) {
+            write_user_timespec_zero(rem_ptr);
+        }
+        return linux_ok(0);
+    }
+
+    uint64_t target = timer_get_ticks() + ticks;
+    if (scheduler_sleep_until((uint64_t*)frame, target)) {
+        if (have_rem) {
+            write_user_timespec_zero(rem_ptr);
+        }
+        return SYSCALL_NO_RETURN;
+    }
+
+    if (have_rem) {
+        write_user_timespec_zero(rem_ptr);
+    }
+    return linux_ok(0);
+}
+
+static syscall_result_t linux_sys_brk(uint64_t brk, syscall_frame_t* frame) {
+    syscall_result_t res = sys_brk(brk, 0, 0, frame);
+    if (!res.should_return) {
+        return res;
+    }
+    return linux_ok(res.value);
+}
+
+static syscall_result_t linux_sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+                                       uint64_t flags, uint64_t fd, uint64_t offset,
+                                       syscall_frame_t* frame) {
+    (void)fd; (void)offset;
+
+    uint64_t packed = (flags << 32) | (prot & 0xFFFFFFFFULL);
+    syscall_result_t res = sys_mmap(addr, length, packed, frame);
+    if (!res.should_return) {
+        return res;
+    }
+    return linux_ok(res.value);
+}
+
+static syscall_result_t linux_sys_read(void) {
+    return linux_error(K_ENOSYS);
+}
+
+static syscall_result_t linux_syscall_dispatch(syscall_frame_t* frame) {
+    uint64_t num = frame->rax;
+    uint64_t arg1 = frame->rdi;
+    uint64_t arg2 = frame->rsi;
+    uint64_t arg3 = frame->rdx;
+    uint64_t arg4 = frame->r10;
+    uint64_t arg5 = frame->r8;
+    uint64_t arg6 = frame->r9;
+
+    switch (num) {
+        case 0:   return linux_sys_read();
+        case 1:   return linux_sys_write((int)arg1, arg2, arg3);
+        case 9:   return linux_sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6, frame);
+        case 12:  return linux_sys_brk(arg1, frame);
+        case 35:  return linux_sys_nanosleep(arg1, arg2, frame);
+        case 39:  return linux_sys_getpid();
+        case 57:  return linux_error(K_ENOSYS); // fork
+        case 59:  return linux_error(K_ENOSYS); // execve
+        case 60:  return linux_sys_exit((int)arg1, frame);
+        case 61:  return linux_error(K_ENOSYS); // wait4
+        default:  return linux_error(K_ENOSYS);
+    }
+}
+
+// Full register frame
+static void set_errno(process_t* proc, int err) {
+    if (proc) {
+        proc->last_errno = err;
+    }
+}
 
 // Copy a userspace timespec into kernel memory
 static bool copy_user_timespec(uint64_t user_ptr, k_timespec_t* out) {
@@ -703,8 +889,7 @@ static syscall_result_t sys_exit(uint64_t arg1, uint64_t arg2, uint64_t arg3, sy
 
     if (current) {
         fd_close_all_for_process(current);
-
-        current->state = PROCESS_TERMINATED;
+        process_exit((int)arg1);
         print(fb, "\nProcess ");
         print(fb, current->name);
         print(fb, " exited with code ");
@@ -840,13 +1025,17 @@ static const syscall_entry_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_HDA_WRITE_PCM] = { "hda_write_pcm", sys_hda_write_pcm_handler },
 };
 
-void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, syscall_frame_t* frame) {
-    struct limine_framebuffer* fb = fb0();
+static syscall_result_t linux_syscall_dispatch(syscall_frame_t* frame);
 
+void syscall_handler_impl(syscall_frame_t* frame) {
+    struct limine_framebuffer* fb = fb0();
     syscall_result_t result = { .value = (uint64_t)-1, .should_return = true };
 
-    if (syscall_num < SYSCALL_TABLE_SIZE && syscall_table[syscall_num].fn) {
-        result = syscall_table[syscall_num].fn(arg1, arg2, arg3, frame);
+    process_t* current = process_current();
+    if (current && current->uses_linux_abi) {
+        result = linux_syscall_dispatch(frame);
+    } else if (frame->rax < SYSCALL_TABLE_SIZE && syscall_table[frame->rax].fn) {
+        result = syscall_table[frame->rax].fn(frame->rbx, frame->rcx, frame->rdx, frame);
     } else {
         print(fb, "[invalid syscall number]\n");
     }
@@ -860,47 +1049,40 @@ void syscall_handler_impl(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, ui
 __attribute__((naked))
 void syscall_handler(void) {
     asm volatile (
-        "push %rax\n"
-        "push %rbx\n"
-        "push %rcx\n"
-        "push %rdx\n"
-        "push %rsi\n"
-        "push %rdi\n"
-        "push %rbp\n"
-        "push %r8\n"
-        "push %r9\n"
-        "push %r10\n"
-        "push %r11\n"
-        "push %r12\n"
-        "push %r13\n"
-        "push %r14\n"
         "push %r15\n"
-        
-        // Syscall convention: RAX=num, RBX=arg1, RCX=arg2, RDX=arg3
-        // C calling convention: RDI=arg1, RSI=arg2, RDX=arg3, RCX=arg4, R8=arg5
-        "mov %rax, %rdi\n"  // syscall number -> arg1
-        "mov %rbx, %rsi\n"  // arg1 -> arg2
-        "mov %rcx, %r8\n"   // arg2 -> temp (r8)
-        "mov %rdx, %rcx\n"  // arg3 -> arg4
-        "mov %r8, %rdx\n"   // temp (arg2) -> arg3
-        "mov %rsp, %r8\n"   // frame pointer -> arg5
+        "push %r14\n"
+        "push %r13\n"
+        "push %r12\n"
+        "push %r11\n"
+        "push %r10\n"
+        "push %r9\n"
+        "push %r8\n"
+        "push %rbp\n"
+        "push %rdi\n"
+        "push %rsi\n"
+        "push %rdx\n"
+        "push %rcx\n"
+        "push %rbx\n"
+        "push %rax\n"
+
+        "mov %rsp, %rdi\n"   // Pass pointer to saved frame
         "call syscall_handler_impl\n"
-        
-        "pop %r15\n"
-        "pop %r14\n"
-        "pop %r13\n"
-        "pop %r12\n"
-        "pop %r11\n"
-        "pop %r10\n"
-        "pop %r9\n"
-        "pop %r8\n"
-        "pop %rbp\n"
-        "pop %rdi\n"
-        "pop %rsi\n"
-        "pop %rdx\n"
-        "pop %rcx\n"
-        "pop %rbx\n"
+
         "pop %rax\n"
+        "pop %rbx\n"
+        "pop %rcx\n"
+        "pop %rdx\n"
+        "pop %rsi\n"
+        "pop %rdi\n"
+        "pop %rbp\n"
+        "pop %r8\n"
+        "pop %r9\n"
+        "pop %r10\n"
+        "pop %r11\n"
+        "pop %r12\n"
+        "pop %r13\n"
+        "pop %r14\n"
+        "pop %r15\n"
         "iretq\n"
     );
 }

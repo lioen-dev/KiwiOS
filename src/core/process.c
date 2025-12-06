@@ -12,6 +12,32 @@ process_t* process_list_head = NULL;
 static process_t* current_process = NULL;
 static uint32_t next_pid = 1;
 
+static void process_link_child(process_t* parent, process_t* child) {
+    if (!parent || !child) return;
+    child->sibling = parent->first_child;
+    parent->first_child = child;
+}
+
+static void process_unlink_child(process_t* parent, process_t* child) {
+    if (!parent || !child) return;
+    process_t* prev = NULL;
+    process_t* iter = parent->first_child;
+
+    while (iter) {
+        if (iter == child) {
+            if (prev) {
+                prev->sibling = iter->sibling;
+            } else {
+                parent->first_child = iter->sibling;
+            }
+            child->sibling = NULL;
+            return;
+        }
+        prev = iter;
+        iter = iter->sibling;
+    }
+}
+
 static void idle_thread(void) {
     while (1) {
         asm volatile ("hlt");
@@ -40,6 +66,49 @@ static void process_reset_cwd(process_t* proc) {
     proc->cwd_initialized = true;
 }
 
+uint32_t process_alloc_pid(void) {
+    return next_pid++;
+}
+
+void process_register(process_t* proc) {
+    if (!proc) return;
+    proc->next = process_list_head;
+    process_list_head = proc;
+}
+
+void process_init_common(process_t* proc, const char* name, uint32_t pid,
+                         bool is_usermode, process_t* parent) {
+    if (!proc) return;
+
+    memset(proc, 0, sizeof(process_t));
+
+    proc->pid = pid;
+    proc->state = PROCESS_READY;
+    proc->is_usermode = is_usermode;
+    proc->has_been_interrupted = false;
+    proc->uses_linux_abi = false;
+    proc->start_ticks = timer_get_ticks();
+    proc->priority = SCHED_DEFAULT_PRIORITY;
+    proc->time_slice_ticks = SCHED_DEFAULT_TIMESLICE_TICKS;
+    proc->time_slice_remaining = proc->time_slice_ticks;
+    proc->parent = parent;
+    proc->exit_status = 0;
+
+    if (parent) {
+        process_link_child(parent, proc);
+    }
+
+    process_reset_fd_table(proc);
+    process_reset_cwd(proc);
+
+    if (name) {
+        size_t len = strlen(name);
+        if (len >= sizeof(proc->name)) len = sizeof(proc->name) - 1;
+        memcpy(proc->name, name, len);
+        proc->name[len] = '\0';
+    }
+}
+
 static bool process_phys_is_reserved(process_t* proc, uint64_t phys) {
     if (!proc || proc->fb_mapping_size == 0) {
         return false;
@@ -62,24 +131,7 @@ static process_t* process_create_kernel(const char* name, void (*entry_point)(vo
     process_t* proc = (process_t*)kmalloc(sizeof(process_t));
     if (!proc) return NULL;
 
-    memset(proc, 0, sizeof(process_t));
-
-    proc->has_been_interrupted = false;
-    proc->pid = pid;
-    proc->state = PROCESS_READY;
-    proc->start_ticks = timer_get_ticks();
-
-    process_reset_fd_table(proc);
-    process_reset_cwd(proc);
-
-    if (name) {
-        size_t len = strlen(name);
-        if (len >= 63) len = 63;
-        for (size_t i = 0; i < len; i++) {
-            proc->name[i] = name[i];
-        }
-        proc->name[len] = '\0';
-    }
+    process_init_common(proc, name, pid, false, NULL);
 
     uint64_t stack_phys = (uint64_t)pmm_alloc_pages(2);
     if (!stack_phys) {
@@ -110,8 +162,7 @@ static process_t* process_create_kernel(const char* name, void (*entry_point)(vo
     proc->interrupt_context.ss     = 0x10;
     proc->interrupt_context.r12    = (uint64_t)entry_point;
 
-    proc->next = process_list_head;
-    process_list_head = proc;
+    process_register(proc);
 
     return proc;
 }
@@ -121,6 +172,9 @@ void process_init(void) {
     if (!idle) return;
 
     idle->state = PROCESS_RUNNING;
+    idle->priority = SCHED_IDLE_PRIORITY;
+    idle->time_slice_ticks = SCHED_DEFAULT_TIMESLICE_TICKS;
+    idle->time_slice_remaining = idle->time_slice_ticks;
     idle->has_been_interrupted = true; // We pretend idle already ran so we can switch to it safely
 
     current_process = idle;
@@ -148,8 +202,18 @@ void process_entry(void) {
     while(1) { asm volatile ("hlt"); }
 }
 
+void process_exit(int status) {
+    process_t* current = process_current();
+    if (!current) {
+        return;
+    }
+
+    current->exit_status = status;
+    current->state = PROCESS_TERMINATED;
+}
+
 process_t* process_create(const char* name, void (*entry_point)(void)) {
-    return process_create_kernel(name, entry_point, next_pid++);
+    return process_create_kernel(name, entry_point, process_alloc_pid());
 }
 
 process_t* process_current(void) {
@@ -257,6 +321,15 @@ void process_destroy(process_t* proc) {
     if (!proc) return;
     extern void syscall_on_process_exit(process_t* proc_ref);
     syscall_on_process_exit(proc);
+
+    if (proc->parent) {
+        process_unlink_child(proc->parent, proc);
+        proc->parent = NULL;
+    }
+
+    for (process_t* child = proc->first_child; child; child = child->sibling) {
+        child->parent = NULL;
+    }
 
     // Remove from sleep queue if queued
     scheduler_cancel_sleep(proc);

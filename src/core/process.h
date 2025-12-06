@@ -47,6 +47,12 @@ typedef struct process {
     char name[64];
     process_state_t state;
 
+    // Basic relationships and lifecycle state
+    struct process* parent;
+    struct process* first_child;
+    struct process* sibling;
+    int exit_status;
+
     context_t context;                     // For voluntary context switches
     interrupt_context_t interrupt_context; // For timer interrupts
     uint64_t stack_top;                    // Kernel stack (for syscalls/interrupts)
@@ -58,6 +64,7 @@ typedef struct process {
     page_table_t* page_table;              // Per-process page table (NULL = use kernel PT)
     bool is_usermode;                      // True if this runs in ring 3
     bool has_been_interrupted;             // True after first timer interrupt
+    bool uses_linux_abi;                   // True if syscalls follow Linux ABI
 
     // Track device mappings that must not be returned to the PMM
     uint64_t fb_mapping_phys_base;
@@ -65,6 +72,11 @@ typedef struct process {
     uint64_t fb_mapping_virt_base;
 
     uint64_t start_ticks;                  // Ticks at process start (for timing)
+
+    // Scheduling attributes
+    int priority;                          // Higher value = higher priority
+    uint32_t time_slice_ticks;             // Base time slice in timer ticks
+    uint32_t time_slice_remaining;         // Remaining ticks in current slice
 
     uint64_t sleep_until;                  // Target tick to wake from sleep
     bool sleep_interrupted;                // True if a sleep was cut short
@@ -87,6 +99,11 @@ process_t* process_current(void);
 process_t* process_get_list(void);
 process_t* process_find_idle(void);
 void process_switch_to(process_t* next);
+uint32_t process_alloc_pid(void);
+void process_register(process_t* proc);
+void process_init_common(process_t* proc, const char* name, uint32_t pid,
+                         bool is_usermode, process_t* parent);
+void process_exit(int status);
 
 extern process_t* process_list_head;
 void process_destroy(process_t* proc);
