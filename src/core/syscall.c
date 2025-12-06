@@ -703,8 +703,7 @@ static syscall_result_t sys_exit(uint64_t arg1, uint64_t arg2, uint64_t arg3, sy
 
     if (current) {
         fd_close_all_for_process(current);
-
-        current->state = PROCESS_TERMINATED;
+        process_exit((int)arg1);
         print(fb, "\nProcess ");
         print(fb, current->name);
         print(fb, " exited with code ");

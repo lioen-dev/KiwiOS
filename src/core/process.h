@@ -47,6 +47,12 @@ typedef struct process {
     char name[64];
     process_state_t state;
 
+    // Basic relationships and lifecycle state
+    struct process* parent;
+    struct process* first_child;
+    struct process* sibling;
+    int exit_status;
+
     context_t context;                     // For voluntary context switches
     interrupt_context_t interrupt_context; // For timer interrupts
     uint64_t stack_top;                    // Kernel stack (for syscalls/interrupts)
@@ -87,6 +93,11 @@ process_t* process_current(void);
 process_t* process_get_list(void);
 process_t* process_find_idle(void);
 void process_switch_to(process_t* next);
+uint32_t process_alloc_pid(void);
+void process_register(process_t* proc);
+void process_init_common(process_t* proc, const char* name, uint32_t pid,
+                         bool is_usermode, process_t* parent);
+void process_exit(int status);
 
 extern process_t* process_list_head;
 void process_destroy(process_t* proc);
