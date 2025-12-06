@@ -5,6 +5,7 @@
 #include "memory/heap.h"
 #include "lib/string.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 bool elf_validate(void* elf_data) {
     if (!elf_data) return false;
@@ -58,8 +59,21 @@ static void cleanup_segments(void) {
     segment_count = 0;
 }
 
+static bool segment_within_user(uint64_t base, uint64_t length) {
+    const uint64_t user_top = 0x800000000000ULL;
+    if (length == 0) {
+        return false;
+    }
+
+    if (base >= user_top) {
+        return false;
+    }
+
+    uint64_t end = base + length;
+    return end <= user_top && end >= base;
+}
+
 process_t* elf_load(const char* name, void* elf_data, size_t size) {
-    (void)size; // Mark as used to silence warning
     
     if (!elf_validate(elf_data)) {
         return NULL;
@@ -150,6 +164,24 @@ process_t* elf_load(const char* name, void* elf_data, size_t size) {
             uint64_t memsz = ph[i].p_memsz;
             uint64_t filesz = ph[i].p_filesz;
             uint64_t offset = ph[i].p_offset;
+
+            if (filesz > memsz || offset + filesz > size) {
+                cleanup_segments();
+                process_free_page_table(proc->page_table);
+                pmm_free_pages((void*)stack_phys, 2);
+                pmm_free_pages((void*)user_stack_phys, 4);
+                kfree(proc);
+                return NULL;
+            }
+
+            if (!segment_within_user(vaddr, memsz)) {
+                cleanup_segments();
+                process_free_page_table(proc->page_table);
+                pmm_free_pages((void*)stack_phys, 2);
+                pmm_free_pages((void*)user_stack_phys, 4);
+                kfree(proc);
+                return NULL;
+            }
             
             // Calculate how many pages we need
             uint64_t vaddr_aligned = PAGE_ALIGN_DOWN(vaddr);
@@ -158,6 +190,11 @@ process_t* elf_load(const char* name, void* elf_data, size_t size) {
             uint64_t total_size = vaddr_end_aligned - vaddr_aligned;
             uint64_t pages_needed = total_size / PAGE_SIZE;
             
+            uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
+            if (ph[i].p_flags & PF_W) {
+                page_flags |= PAGE_WRITE;
+            }
+
             // Allocate physical pages
             uint64_t segment_phys = (uint64_t)pmm_alloc_pages(pages_needed);
             if (!segment_phys) {
@@ -180,8 +217,7 @@ process_t* elf_load(const char* name, void* elf_data, size_t size) {
                 uint64_t virt_page = vaddr_aligned + (j * PAGE_SIZE);
                 uint64_t phys_page = segment_phys + (j * PAGE_SIZE);
                 
-                if (!vmm_map_page(pt, virt_page, phys_page,
-                  PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) {
+                if (!vmm_map_page(pt, virt_page, phys_page, page_flags)) {
                     // Cleanup on failure
                     cleanup_segments();
                     process_free_page_table(proc->page_table);
@@ -363,6 +399,3 @@ process_t* elf_load_with_args(const char* name, void* elf_data, size_t size,
 
     return proc;
 }
-
-// optional: keep old API as wrapper
-process_t* elf_load(const char* name, void* elf_data, size_t size);
