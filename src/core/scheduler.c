@@ -9,9 +9,32 @@ extern void print(struct limine_framebuffer *fb, const char *s);
 extern struct limine_framebuffer *fb0(void);
 extern void print_u64(struct limine_framebuffer *fb, uint64_t v);
 
+// The interrupt frame layout produced by irq0_handler() plus the CPU-pushed
+// RIP/CS/RFLAGS trio. Keep this in sync with the push/pop order in main.c.
+typedef struct {
+    uint64_t rax;
+    uint64_t rbx;
+    uint64_t rcx;
+    uint64_t rdx;
+    uint64_t rsi;
+    uint64_t rdi;
+    uint64_t rbp;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t rip;
+    uint64_t cs;
+    uint64_t rflags;
+} __attribute__((packed)) context_frame_t;
+
 typedef struct task {
     const char *name;
-    uint64_t *stack_top; // Points to saved rax in the interrupt-style frame
+    context_frame_t *stack_top; // Points to saved rax in the interrupt-style frame
     uint8_t *stack_base;
     size_t stack_size;
     void (*entry)(void *);
@@ -23,28 +46,6 @@ typedef struct task {
 #define DEFAULT_STACK_SIZE (16 * 1024)
 
 // Layout that matches irq0_handler's push order.
-enum context_slots {
-    CTX_RAX = 0,
-    CTX_RBX,
-    CTX_RCX,
-    CTX_RDX,
-    CTX_RSI,
-    CTX_RDI,
-    CTX_RBP,
-    CTX_R8,
-    CTX_R9,
-    CTX_R10,
-    CTX_R11,
-    CTX_R12,
-    CTX_R13,
-    CTX_R14,
-    CTX_R15,
-    CTX_RIP,
-    CTX_CS,
-    CTX_RFLAGS,
-    CTX_SLOTS
-};
-
 static task_t g_tasks[MAX_TASKS];
 static size_t g_task_count = 0;
 static size_t g_current = 0;
@@ -60,17 +61,16 @@ static void task_trampoline(task_t *task) {
     for (;;) asm volatile ("hlt");
 }
 
-static uint64_t *build_initial_frame(task_t *task) {
-    size_t slots = CTX_SLOTS;
-    uint64_t *frame = (uint64_t *)(task->stack_base + task->stack_size);
-    frame -= slots;
-    memset(frame, 0, slots * sizeof(uint64_t));
+static context_frame_t *build_initial_frame(task_t *task) {
+    context_frame_t *frame = (context_frame_t *)(task->stack_base + task->stack_size);
+    frame--; // carve space for the synthetic interrupt frame
+    memset(frame, 0, sizeof(context_frame_t));
 
-    frame[CTX_RIP] = (uint64_t)task_trampoline;
-    frame[CTX_CS] = 0x08; // Kernel code segment from GDT
-    frame[CTX_RFLAGS] = 0x202; // IF=1
-    frame[CTX_RBP] = (uint64_t)(task->stack_base + task->stack_size);
-    frame[CTX_RDI] = (uint64_t)task;
+    frame->rip = (uint64_t)task_trampoline;
+    frame->cs = 0x08; // Kernel code segment from GDT
+    frame->rflags = 0x202; // IF=1
+    frame->rbp = (uint64_t)(task->stack_base + task->stack_size);
+    frame->rdi = (uint64_t)task;
 
     return frame;
 }
@@ -117,7 +117,7 @@ uint64_t *scheduler_tick(uint64_t *interrupt_rsp) {
     if (!g_scheduler_ready || g_task_count == 0) return interrupt_rsp;
 
     task_t *current = &g_tasks[g_current];
-    current->stack_top = interrupt_rsp;
+    current->stack_top = (context_frame_t *)interrupt_rsp;
 
     if (g_task_count == 1) return interrupt_rsp;
 
@@ -132,7 +132,12 @@ uint64_t *scheduler_tick(uint64_t *interrupt_rsp) {
     }
 
     g_current = next;
-    return g_tasks[g_current].stack_top;
+    if (!g_tasks[g_current].stack_top) {
+        // Safety: refuse to jump to an uninitialized stack frame.
+        return interrupt_rsp;
+    }
+
+    return (uint64_t *)g_tasks[g_current].stack_top;
 }
 
 size_t scheduler_task_count(void) {
