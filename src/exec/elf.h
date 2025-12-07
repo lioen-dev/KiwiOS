@@ -52,6 +52,16 @@ typedef struct {
 #define ELFMAG3       'F'
 #define ELFCLASS64    2
 #define ELFDATA2LSB   1
+#define EV_CURRENT    1
+
+// Object file types
+#define ET_NONE       0
+#define ET_REL        1
+#define ET_EXEC       2
+#define ET_DYN        3
+
+// Machine types
+#define EM_X86_64     0x3E
 
 // Segment types
 #define PT_NULL       0
