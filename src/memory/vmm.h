@@ -13,6 +13,7 @@
 #define PAGE_PRESENT (1 << 0)
 #define PAGE_WRITE (1 << 1)
 #define PAGE_USER (1 << 2)
+#define PAGE_NO_EXEC (1ULL << 63)
 
 // Virtual address manipulation
 #define PAGE_ALIGN_DOWN(addr) ((addr) & ~0xFFFULL)
