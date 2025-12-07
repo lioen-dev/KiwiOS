@@ -44,6 +44,7 @@ typedef struct {
 #define EI_MAG3       3
 #define EI_CLASS      4
 #define EI_DATA       5
+#define EI_VERSION    6
 
 // Magic numbers
 #define ELFMAG0       0x7f
