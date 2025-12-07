@@ -2,7 +2,6 @@
 #include "drivers/blockdev.h"
 #include "drivers/timer.h"
 #include "memory/heap.h"
-#include "core/process.h"
 #include "lib/string.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -113,16 +112,6 @@ struct ext2_fs {
 static char kernel_cwd[512] = "/";
 
 static char* current_process_cwd(void) {
-    process_t* proc = process_current();
-    if (proc) {
-        if (!proc->cwd_initialized) {
-            proc->cwd[0] = '/';
-            proc->cwd[1] = '\0';
-            proc->cwd_initialized = true;
-        }
-        return proc->cwd;
-    }
-
     return kernel_cwd;
 }
 

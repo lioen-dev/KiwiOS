@@ -9,12 +9,8 @@
 #include "memory/vmm.h"
 #include "memory/heap.h"
 #include "memory/hhdm.h"
-#include "core/process.h"
-#include "core/scheduler.h"
 #include "drivers/timer.h"
 #include "arch/x86/io.h"
-#include "exec/elf.h"
-#include "core/syscall.h"
 #include "drivers/pci.h"
 #include "drivers/blockdev.h"
 #include "drivers/ata.h"
@@ -624,56 +620,6 @@ static const char *exception_messages[] = {
     "Reserved"
 };
 
-void handle_usermode_exception(struct exception_frame *frame) {
-    struct limine_framebuffer *fb = fb0();
-    process_t* proc = process_current();
-    
-    print(fb, "\nUsermode exception in process: ");
-    print(fb, proc->name);
-    print(fb, "\n");
-    
-    print(fb, "Exception: ");
-    if (frame->int_no < 32) {
-        print(fb, exception_messages[frame->int_no]);
-    }
-    print(fb, "\nRIP: ");
-    print_hex(fb, frame->rip);
-    print(fb, "\n");
-
-    // We are still using the faulting task's CR3. Switch back to the kernel
-    // address space before we clean up or try to run something else so that a
-    // freed user page table cannot trap us in more faults.
-    page_table_t* kpt = vmm_get_kernel_page_table();
-    if (kpt) {
-        vmm_switch_page_table(kpt);
-    }
-
-    // Terminate the process
-    proc->state = PROCESS_TERMINATED;
-    
-    // Clean up and find next process
-    process_cleanup_terminated();
-    
-    // Try to switch to another process
-    process_t* next = process_get_list();
-    while (next) {
-        if (next->state == PROCESS_READY) {
-            print(fb, "Switching to process: ");
-            print(fb, next->name);
-            print(fb, "\n\n");
-            process_switch_to(next);
-            return; // Will return to the new process
-        }
-        next = next->next;
-    }
-    
-    // No other process, go back to idle/shell
-    next = process_get_list();
-    if (next && next->pid == 0) {
-        process_switch_to(next);
-    }
-}
-
 // A tiny helper the compiler knows never returns
 __attribute__((noreturn)) static void panic_halt_forever(void) {
     // Disable interrupts and halt forever
@@ -685,12 +631,6 @@ __attribute__((noreturn)) static void panic_halt_forever(void) {
 __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     struct limine_framebuffer *fb = fb0();
     if (!fb) panic_halt_forever();
-
-    // User-mode exception? Hand it off and return to the common stub.
-    if ((frame->cs & 3) == 3) {
-        handle_usermode_exception(frame);
-        return; // the scheduler/code should rewrite the frame or pick a new proc
-    }
 
     // --- Kernel-mode fault: collect extra context before drawing ---
     uint64_t cr2 = 0;
@@ -831,9 +771,8 @@ extern void hda_interrupt_handler(void);
 __attribute__((naked)) void irq0_handler(void) {
     asm volatile (
         // Push registers in the same order expected by interrupt_context_t
-        // (r15 at the top of the stack, then r14..rax). The scheduler and
-        // syscall handlers treat the interrupt frame as an array beginning
-        // with r15, so keep the layout consistent here.
+        // (r15 at the top of the stack, then r14..rax) so the handler
+        // can treat the interrupt frame as a packed array.
         "push %r15\n"
         "push %r14\n"
         "push %r13\n"
@@ -965,12 +904,6 @@ void init_idt(void) {
     
     // Timer IRQ (IRQ 0 = interrupt 32)
     idt_set_gate(32, (uint64_t)irq0_handler);
-
-    extern void syscall_handler(void);
-    idt_set_gate(0x80, (uint64_t)syscall_handler);
-
-    // After setting up all exception handlers, set syscall differently:
-    idt[0x80].type_attr = 0xEE; // Change to DPL=3 (ring 3 can call)
 
     // Load IDT
     idtr.limit = sizeof(idt) - 1;
@@ -1165,7 +1098,6 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  pwd             - Print working directory\n");
     print(fb, "  cd [path]      - Change directory (default: /)\n");
     print(fb, "  cat <file>     - Display file contents\n");
-    print(fb, "  run <file>     - Execute a program\n");
     print(fb, "  touch <file>   - Create an empty file\n");
     print(fb, "  append <file> <text> - Append text to a file\n");
     print(fb, "  truncate <file> <size> - Truncate file to size bytes\n");
@@ -1177,9 +1109,6 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  memtest    - Run memory test\n");
     print(fb, "  vmtest     - Run virtual memory test\n");
     print(fb, "  heaptest   - Run heap allocation test\n");
-    print(fb, "  pslist     - List running processes\n");
-    print(fb, "  psdebug    - Show debug info for current process\n");
-    print(fb, "  switch     - Switch to next process\n");
     print(fb, "  fbinfo     - Show framebuffer information\n");
     print(fb, "  crash [n]  - Trigger exception number n (default 0)\n");
 }
@@ -1536,124 +1465,6 @@ void cmd_heaptest(struct limine_framebuffer *fb) {
     print(fb, "After free - Active allocations: ");
     print_hex(fb, allocs);
     print(fb, "\n");
-}
-
-void test_process_1(void) {
-    struct limine_framebuffer *fb = fb0();
-    
-    for (int i = 0; i < 5; i++) {
-        print(fb, "Process 1 tick ");
-        print_hex(fb, timer_get_ticks());
-        print(fb, "\n");
-        
-        // Busy wait a bit so we can see it
-        for (volatile int j = 0; j < 10000000; j++);
-    }
-    
-    print(fb, "Process 1 done\n");
-}
-
-void test_process_2(void) {
-    struct limine_framebuffer *fb = fb0();
-    
-    for (int i = 0; i < 5; i++) {
-        print(fb, "Process 2 tick ");
-        print_hex(fb, timer_get_ticks());
-        print(fb, "\n");
-        
-        // Busy wait a bit
-        for (volatile int j = 0; j < 10000000; j++);
-    }
-    
-    print(fb, "Process 2 done\n");
-}
-
-void cmd_pslist(struct limine_framebuffer *fb) {
-    print(fb, "Process List:\n");
-    print(fb, "PID  STATE      NAME\n");
-    print(fb, "---  ---------  ----\n");
-    
-    process_t* proc = process_get_list();
-    
-    while (proc) {
-        print_hex(fb, proc->pid);
-        print(fb, "  ");
-        
-        switch (proc->state) {
-            case PROCESS_READY:
-                print(fb, "READY     ");
-                break;
-            case PROCESS_RUNNING:
-                print(fb, "RUNNING   ");
-                break;
-            case PROCESS_SLEEPING:
-                print(fb, "SLEEPING  ");
-                break;
-            case PROCESS_TERMINATED:
-                print(fb, "TERMINATED");
-                break;
-        }
-        print(fb, "  ");
-        
-        print(fb, proc->name);
-        print(fb, "\n");
-        
-        proc = proc->next;
-    }
-}
-
-void cmd_switch(struct limine_framebuffer *fb) {
-    process_t* current = process_current();
-    print(fb, "Current: ");
-    print(fb, current->name);
-    print(fb, " (PID ");
-    print_hex(fb, current->pid);
-    print(fb, ")\n");
-    
-    // Find next ready process
-    process_t* next = current->next;
-    if (!next) next = process_get_list();
-    
-    while (next && next != current) {
-        if (next->state == PROCESS_READY) {
-            print(fb, "Switching to: ");
-            print(fb, next->name);
-            print(fb, "\n");
-            
-            process_switch_to(next);
-            
-            // When we return here, we've been switched back
-            print(fb, "Back to: ");
-            print(fb, process_current()->name);
-            print(fb, "\n");
-            return;
-        }
-        next = next->next;
-        if (!next) next = process_get_list();
-    }
-    
-    print(fb, "No ready processes\n");
-}
-
-void cmd_psdebug(struct limine_framebuffer *fb) {
-    process_t* proc = process_get_list();
-    
-    while (proc) {
-        print(fb, "Process: ");
-        print(fb, proc->name);
-        print(fb, "\n");
-        print(fb, "  PID: ");
-        print_hex(fb, proc->pid);
-        print(fb, "\n");
-        print(fb, "  RSP: ");
-        print_hex(fb, proc->context.rsp);
-        print(fb, "\n");
-        print(fb, "  Stack Top: ");
-        print_hex(fb, proc->stack_top);
-        print(fb, "\n\n");
-        
-        proc = proc->next;
-    }
 }
 
 // --- fbinfo: list all Limine framebuffers and modes ---
@@ -2026,38 +1837,6 @@ void cmd_truncate(struct limine_framebuffer* fb, const char* path, size_t new_si
     if (!ext2_truncate(g_fs, path, (uint32_t)new_size)) kputs("truncate: failed\n");
 }
 
-void cmd_run(struct limine_framebuffer* fb, const char* args) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!args || !*args) { kputs("usage: run <file.elf> [args...]\n"); return; }
-
-    const char* p = args;
-    char prog[256]; size_t n=0;
-    while (*p && *p!=' ' && n < sizeof(prog)-1) { prog[n++]=*p++; }
-    prog[n]='\0';
-
-    int argc = 0; const char* argv_arr[8];
-    argv_arr[argc++] = prog;
-    while (*p==' ') p++;
-    while (*p && argc < 8) {
-        argv_arr[argc++] = p;
-        while (*p && *p!=' ') p++;
-        if (*p==' ') { *((char*)p) = '\0'; p++; while (*p==' ') p++; }
-    }
-
-    size_t fsz = 0;
-    void* data = ext2_read_entire_file(g_fs, prog, &fsz);
-    if (!data) { kputs("run: cannot read file\n"); return; }
-    if (!elf_validate(data)) { kputs("run: not a valid ELF64\n"); extern void kfree(void*); kfree(data); return; }
-
-    process_t* proc = elf_load_with_args(prog, data, fsz, argc, argv_arr);
-    extern void kfree(void*);
-    kfree(data);
-    if (!proc) { kputs("run: load failed\n"); return; }
-    kputs("started process: "); kputs(proc->name); kputs("\n");
-    process_switch_to(proc);
-}
-
 static void print_prompt(void) {
     const char *cwd = "/";
     if (g_fs) {
@@ -2117,9 +1896,6 @@ struct command commands[] = {
     {"memtest", cmd_memtest},
     {"vmtest", cmd_vmtest},
     {"heaptest", cmd_heaptest},
-    {"pslist", cmd_pslist},
-    {"psdebug", cmd_psdebug},
-    {"switch", cmd_switch},
     {"fbinfo", cmd_fbinfo},
     {"beep", cmd_beep},
     {"reboot",   cmd_reboot},
@@ -2161,7 +1937,6 @@ void execute_command(struct limine_framebuffer *fb, char *input) {
     if (strcmp(input, "pwd") == 0)   { cmd_pwd(fb); return; }
     if (strcmp(input, "cd") == 0)    { cmd_cd(fb, (args && *args) ? args : "/"); return; }
     if (strcmp(input, "cat") == 0)   { cmd_cat(fb, args); return; }
-    if (strcmp(input, "run") == 0)   { cmd_run(fb, args); return; }
     if (strcmp(input, "touch") == 0) { cmd_touch(fb, args); return; }
 
     if (strcmp(input, "append") == 0) {
@@ -2344,7 +2119,6 @@ void kmain(void) {
     init_idt();
     tss_init();
     gdt_init();
-    syscall_init();
     acpi_init();
 
     if (memmap_request.response != NULL) {
@@ -2353,8 +2127,6 @@ void kmain(void) {
 
     vmm_init();
     heap_init();
-    process_init();
-    scheduler_init();
 
     // Initialize PIC (Programmable Interrupt Controller)
     outb(0x20, 0x11);
