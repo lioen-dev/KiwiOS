@@ -10,6 +10,7 @@
 #include "memory/heap.h"
 #include "memory/hhdm.h"
 #include "drivers/timer.h"
+#include "core/scheduler.h"
 #include "arch/x86/io.h"
 #include "drivers/pci.h"
 #include "drivers/blockdev.h"
@@ -765,7 +766,7 @@ __attribute__((naked)) void exception_handler_common(void) {
     );
 }
 
-extern void timer_handler(uint64_t* interrupt_rsp);
+extern uint64_t* timer_handler(uint64_t* interrupt_rsp);
 extern void hda_interrupt_handler(void);
 
 __attribute__((naked)) void irq0_handler(void) {
@@ -791,6 +792,7 @@ __attribute__((naked)) void irq0_handler(void) {
         
         "mov %rsp, %rdi\n"  // Pass pointer to interrupt frame
         "call timer_handler\n"
+        "mov %rax, %rsp\n"  // Allow handler to pick a different context
         
         // Send EOI to PIC (AT&T: use DX as the port register)
         "mov $0x20, %al\n"
@@ -1090,6 +1092,9 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  shutdown   - Shutdown the system\n");
     print(fb, "  reboot     - Reboot the system\n");
     print(fb, "  pcilist    - List PCI devices\n");
+    print(fb, "  timer      - Show PIT stats and sleep for 1 second\n");
+    print(fb, "  tasks      - List kernel scheduler tasks\n");
+    print(fb, "  scheddemo  - Spawn two preempted kernel threads\n");
 
     print(fb, "\n");
 
@@ -1575,6 +1580,43 @@ void cmd_fbinfo(struct limine_framebuffer *fb_unused) {
     }
 }
 
+static void demo_task(void *arg) {
+    const char *name = (const char *)arg;
+
+    while (1) {
+        print(NULL, "[task] ");
+        print(NULL, name);
+        print(NULL, " tick ");
+        print_u64(NULL, timer_get_ticks());
+        print(NULL, "\n");
+        timer_sleep_ms(500);
+    }
+}
+
+void cmd_tasks(struct limine_framebuffer *fb) {
+    (void)fb;
+    scheduler_dump_tasks();
+}
+
+void cmd_scheddemo(struct limine_framebuffer *fb) {
+    (void)fb;
+    static int started = 0;
+
+    if (started) {
+        print(NULL, "[sched] demo already running\n");
+        return;
+    }
+
+    if (scheduler_create_kernel_task("demo-a", demo_task, "A", 0) != 0 ||
+        scheduler_create_kernel_task("demo-b", demo_task, "B", 0) != 0) {
+        print(NULL, "[sched] failed to create demo tasks\n");
+        return;
+    }
+
+    started = 1;
+    print(NULL, "[sched] spawned two demo tasks; watch them tick\n");
+}
+
 void cmd_shutdown(struct limine_framebuffer *fb) {
     (void)fb;
     print(NULL, "Shutting down...\n");
@@ -1929,6 +1971,8 @@ struct command commands[] = {
     {"heaptest", cmd_heaptest},
     {"fbinfo", cmd_fbinfo},
     {"timer", cmd_timer},
+    {"tasks", cmd_tasks},
+    {"scheddemo", cmd_scheddemo},
     {"beep", cmd_beep},
     {"reboot",   cmd_reboot},
     {"shutdown", cmd_shutdown},
@@ -2176,6 +2220,9 @@ void kmain(void) {
 
     // Initialize timer at 100 Hz
     timer_init(100);
+
+    // Bring up the round-robin kernel scheduler and task support
+    scheduler_init();
 
     // Unmask only IRQ0 (timer)
     outb(0x21, 0xFE);

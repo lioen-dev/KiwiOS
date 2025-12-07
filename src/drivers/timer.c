@@ -32,12 +32,14 @@ uint64_t timer_get_ticks(void) {
     return ticks;
 }
 
-void timer_handler(uint64_t* interrupt_rsp) {
+uint64_t* timer_handler(uint64_t* interrupt_rsp) {
     ticks++;
 
     if (tick_handler) {
-        tick_handler(interrupt_rsp);
+        return tick_handler(interrupt_rsp);
     }
+
+    return interrupt_rsp;
 }
 
 void timer_register_tick_handler(timer_tick_handler_t handler) {
