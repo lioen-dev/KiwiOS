@@ -1110,6 +1110,7 @@ void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "  vmtest     - Run virtual memory test\n");
     print(fb, "  heaptest   - Run heap allocation test\n");
     print(fb, "  fbinfo     - Show framebuffer information\n");
+    print(fb, "  timer      - Run a PIT tick sanity check\n");
     print(fb, "  crash [n]  - Trigger exception number n (default 0)\n");
 }
 
@@ -1171,6 +1172,36 @@ void cmd_beep(struct limine_framebuffer *fb) {
     HDA_enqueue_interleaved_pcm(buffer, frames);
     extern void kfree(void *p);
     kfree(buffer);
+}
+
+void cmd_timer(struct limine_framebuffer *fb) {
+    (void)fb;
+
+    uint32_t freq = timer_get_frequency();
+    uint64_t ticks_before = timer_get_ticks();
+    uint64_t ms_before = timer_ms_since_boot();
+
+    print(NULL, "[timer] PIT frequency: ");
+    print_u32(NULL, freq);
+    print(NULL, " Hz\n");
+
+    print(NULL, "[timer] ticks since boot: ");
+    print_u64(NULL, ticks_before);
+    print(NULL, " (~");
+    print_u64(NULL, ms_before);
+    print(NULL, " ms)\n");
+
+    print(NULL, "[timer] sleeping for 1000 ms...\n");
+    timer_sleep_ms(1000);
+
+    uint64_t elapsed_ticks = timer_get_ticks() - ticks_before;
+    uint64_t approx_ms = (freq != 0) ? ((elapsed_ticks * 1000ull) / freq) : 0;
+
+    print(NULL, "[timer] woke after ");
+    print_u64(NULL, elapsed_ticks);
+    print(NULL, " ticks (~");
+    print_u64(NULL, approx_ms);
+    print(NULL, " ms)\n");
 }
 
 void cmd_crash(struct limine_framebuffer *fb, const char *args) {
@@ -1897,6 +1928,7 @@ struct command commands[] = {
     {"vmtest", cmd_vmtest},
     {"heaptest", cmd_heaptest},
     {"fbinfo", cmd_fbinfo},
+    {"timer", cmd_timer},
     {"beep", cmd_beep},
     {"reboot",   cmd_reboot},
     {"shutdown", cmd_shutdown},
