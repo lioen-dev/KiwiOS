@@ -20,7 +20,9 @@
 #include "drivers/ahci.h"
 #include "drivers/acpi.h"
 #include "drivers/hda.h"
-
+#include "core/process.h"
+#include "core/syscall.h"
+#include "core/elf.h"
 #include "lib/string.h"
 
 
@@ -2203,6 +2205,8 @@ void kmain(void) {
 
     vmm_init();
     heap_init();
+    process_init();
+    syscall_init();
 
     // Initialize PIC (Programmable Interrupt Controller)
     outb(0x20, 0x11);
