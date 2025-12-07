@@ -493,7 +493,9 @@ void process_entry_usermode(void) {
     }
     
     // Drop to ring 3
-    enter_usermode((uint64_t)entry_func, proc->user_stack_top);
+    uint64_t initial_rsp = proc->interrupt_context.rsp ? proc->interrupt_context.rsp
+                                                       : proc->user_stack_top;
+    enter_usermode((uint64_t)entry_func, initial_rsp);
     
     // Never returns
 }

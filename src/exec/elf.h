@@ -45,6 +45,7 @@ typedef struct {
 #define EI_CLASS      4
 #define EI_DATA       5
 #define EI_VERSION    6
+#define EI_OSABI      7
 
 // Magic numbers
 #define ELFMAG0       0x7f
@@ -54,6 +55,8 @@ typedef struct {
 #define ELFCLASS64    2
 #define ELFDATA2LSB   1
 #define EV_CURRENT    1
+#define ELFOSABI_SYSV   0
+#define ELFOSABI_LINUX  3
 
 // Object file types
 #define ET_NONE       0

@@ -341,8 +341,9 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
     if (!elf_validate(elf_data)) {
         return NULL;
     }
-    
+
     elf64_header_t* header = (elf64_header_t*)elf_data;
+    bool linux_abi = (header->e_ident[EI_OSABI] == ELFOSABI_LINUX);
     
     uint64_t ph_bytes = (uint64_t)header->e_phnum * header->e_phentsize;
     if (header->e_phoff > size || ph_bytes > size - header->e_phoff) {
@@ -714,7 +715,7 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
         return NULL;
     }
 
-    proc->uses_linux_abi = true;
+    proc->uses_linux_abi = linux_abi;
 
     // Clear segment tracking since we succeeded
     segment_count = 0;
