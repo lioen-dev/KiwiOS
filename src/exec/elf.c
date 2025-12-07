@@ -13,6 +13,7 @@
 #define USER_STACK_PAGES 5                // 1 guard + 4 usable
 #define USER_STACK_USABLE_PAGES 4
 #define MAX_ARGV_ENTRIES 128
+#define MAX_SEGMENTS 32
 
 bool elf_validate(void* elf_data) {
     if (!elf_data) return false;
@@ -46,7 +47,8 @@ bool elf_validate(void* elf_data) {
     // Program header bounds and sizes
     if (header->e_ehsize < sizeof(elf64_header_t)) return false;
     if (header->e_phentsize != sizeof(elf64_program_header_t)) return false;
-    if (header->e_phnum == 0) return false;
+    if (header->e_phnum == 0 || header->e_phnum > MAX_SEGMENTS) return false;
+    if (header->e_phoff < header->e_ehsize) return false;
 
     // Ensure program header table fits in file
     uint64_t ph_bytes = (uint64_t)header->e_phnum * header->e_phentsize;
@@ -61,7 +63,6 @@ typedef struct {
     uint64_t num_pages;
 } segment_alloc_t;
 
-#define MAX_SEGMENTS 32
 static segment_alloc_t segment_allocs[MAX_SEGMENTS];
 static int segment_count = 0;
 
@@ -172,7 +173,8 @@ static void fill_random_bytes(uint8_t* buffer, size_t length, uint32_t seed_extr
 }
 
 static bool build_initial_stack(process_t* proc, const elf64_header_t* header,
-                                int argc, const char** argv, uint64_t load_base,
+                                int argc, const char** argv, uint64_t phdr_addr,
+                                uint64_t entry_point, uint64_t base_addr,
                                 const char* exec_name) {
     if (!proc || !proc->page_table) {
         return false;
@@ -203,15 +205,13 @@ static bool build_initial_stack(process_t* proc, const elf64_header_t* header,
     uint64_t strings_base = USER_STACK_TOP - string_bytes;
 
     // Auxiliary vector entries
-    uint64_t phdr_addr = (load_base == UINT64_MAX) ? 0 : load_base + header->e_phoff;
-
     uint64_t auxv[][2] = {
         { AT_PHDR,     phdr_addr },
         { AT_PHENT,    header->e_phentsize },
         { AT_PHNUM,    header->e_phnum },
-        { AT_ENTRY,    header->e_entry },
+        { AT_ENTRY,    entry_point },
         { AT_PAGESZ,   PAGE_SIZE },
-        { AT_BASE,     0 },
+        { AT_BASE,     base_addr },
         { AT_UID,      0 },
         { AT_EUID,     0 },
         { AT_GID,      0 },
@@ -349,6 +349,38 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
         return NULL;
     }
 
+    elf64_program_header_t* ph = (elf64_program_header_t*)((uint8_t*)elf_data + header->e_phoff);
+
+    bool has_load = false;
+    bool has_interp = false;
+    bool has_tls = false;
+    bool has_phdr = false;
+    uint64_t phdr_vaddr = 0;
+
+    for (int i = 0; i < header->e_phnum; i++) {
+        switch (ph[i].p_type) {
+            case PT_LOAD:
+                has_load = true;
+                break;
+            case PT_INTERP:
+                has_interp = true;
+                break;
+            case PT_TLS:
+                has_tls = true;
+                break;
+            case PT_PHDR:
+                has_phdr = true;
+                phdr_vaddr = ph[i].p_vaddr;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!has_load || has_interp || has_tls) {
+        return NULL; // Require at least one loadable segment and no unsupported interpreters/TLS yet
+    }
+
     // Reset segment tracking for this load
     segment_count = 0;
 
@@ -407,7 +439,6 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
     proc->user_stack_top = USER_STACK_TOP;
 
     // Load program segments
-    elf64_program_header_t* ph = (elf64_program_header_t*)((uint8_t*)elf_data + header->e_phoff);
     uint64_t load_base = UINT64_MAX;
 
     for (int i = 0; i < header->e_phnum; i++) {
@@ -553,6 +584,72 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
         }
     }
 
+    if (load_base == UINT64_MAX) {
+        cleanup_segments();
+        process_free_page_table(proc->page_table);
+        pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);
+        pmm_free_pages((void*)stack_phys, 2);
+        kfree(proc);
+        return NULL;
+    }
+
+    uint64_t entry_point = header->e_entry;
+    if (header->e_type == ET_DYN) {
+        if (entry_point > UINT64_MAX - load_base) {
+            cleanup_segments();
+            process_free_page_table(proc->page_table);
+            pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);
+            pmm_free_pages((void*)stack_phys, 2);
+            kfree(proc);
+            return NULL;
+        }
+        entry_point += load_base;
+    }
+
+    if (!segment_within_user(entry_point, 1)) {
+        cleanup_segments();
+        process_free_page_table(proc->page_table);
+        pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);
+        pmm_free_pages((void*)stack_phys, 2);
+        kfree(proc);
+        return NULL;
+    }
+
+    uint64_t phdr_runtime = 0;
+    if (has_phdr) {
+        uint64_t bias = (header->e_type == ET_DYN) ? load_base : 0;
+        if (phdr_vaddr > UINT64_MAX - bias) {
+            cleanup_segments();
+            process_free_page_table(proc->page_table);
+            pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);
+            pmm_free_pages((void*)stack_phys, 2);
+            kfree(proc);
+            return NULL;
+        }
+        phdr_runtime = phdr_vaddr + bias;
+    } else {
+        if (header->e_phoff > UINT64_MAX - load_base) {
+            cleanup_segments();
+            process_free_page_table(proc->page_table);
+            pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);
+            pmm_free_pages((void*)stack_phys, 2);
+            kfree(proc);
+            return NULL;
+        }
+        phdr_runtime = load_base + header->e_phoff;
+    }
+
+    uint64_t aux_base = (header->e_type == ET_DYN) ? load_base : 0;
+
+    if (!segment_within_user(phdr_runtime, ph_bytes)) {
+        cleanup_segments();
+        process_free_page_table(proc->page_table);
+        pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);
+        pmm_free_pages((void*)stack_phys, 2);
+        kfree(proc);
+        return NULL;
+    }
+
     // Initialize heap (after loading all segments)
     uint64_t highest_addr = 0;
     ph = (elf64_program_header_t*)((uint8_t*)elf_data + header->e_phoff);
@@ -594,7 +691,7 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
     proc->context.rsp = (uint64_t)stack;
     proc->context.rbp = 0;
     proc->context.rbx = 0;
-    proc->context.r12 = header->e_entry;  // Store entry for process_entry wrapper
+    proc->context.r12 = entry_point;  // Store entry for process_entry wrapper
     proc->context.r13 = 0;
     proc->context.r14 = 0;
     proc->context.r15 = 0;
@@ -602,14 +699,13 @@ static process_t* elf_load_internal(const char* name, void* elf_data, size_t siz
 
     // Initialize interrupt_context with valid usermode state
     memset(&proc->interrupt_context, 0, sizeof(proc->interrupt_context));
-    proc->interrupt_context.rip = header->e_entry;  // Entry point
+    proc->interrupt_context.rip = entry_point;  // Entry point
     proc->interrupt_context.cs = 0x1B;              // User code segment (ring 3)
     proc->interrupt_context.rflags = 0x202;         // Interrupts enabled
     proc->interrupt_context.ss = 0x23;              // User data segment (ring 3)
 
-    if (!build_initial_stack(proc, header, argc, argv,
-                             load_base == UINT64_MAX ? 0 : load_base,
-                             name)) {
+    if (!build_initial_stack(proc, header, argc, argv, phdr_runtime,
+                             entry_point, aux_base, name)) {
         cleanup_segments();
         process_free_page_table(proc->page_table);
         pmm_free_pages((void*)user_stack_phys, USER_STACK_PAGES);

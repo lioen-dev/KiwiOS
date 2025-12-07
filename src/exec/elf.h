@@ -69,6 +69,10 @@ typedef struct {
 #define PT_LOAD       1
 #define PT_DYNAMIC    2
 #define PT_INTERP     3
+#define PT_NOTE       4
+#define PT_SHLIB      5
+#define PT_PHDR       6
+#define PT_TLS        7
 
 // Segment flags
 #define PF_X          0x1
