@@ -9,21 +9,7 @@
 #include "memory/vmm.h"
 #include "memory/heap.h"
 #include "memory/hhdm.h"
-#include "core/process.h"
-#include "core/scheduler.h"
-#include "drivers/timer.h"
 #include "arch/x86/io.h"
-#include "exec/elf.h"
-#include "core/syscall.h"
-#include "drivers/pci.h"
-#include "drivers/blockdev.h"
-#include "drivers/ata.h"
-#include "fs/mbr.h"
-#include "fs/ext2.h"
-#include "drivers/ahci.h"
-#include "drivers/acpi.h"
-#include "drivers/hda.h"
-
 #include "lib/string.h"
 
 static void kputs(const char* s);
@@ -626,48 +612,6 @@ static const char *exception_messages[] = {
     "Reserved"
 };
 
-void handle_usermode_exception(struct exception_frame *frame) {
-    struct limine_framebuffer *fb = fb0();
-    process_t* proc = process_current();
-    
-    print(fb, "\nUsermode exception in process: ");
-    print(fb, proc->name);
-    print(fb, "\n");
-    
-    print(fb, "Exception: ");
-    if (frame->int_no < 32) {
-        print(fb, exception_messages[frame->int_no]);
-    }
-    print(fb, "\nRIP: ");
-    print_hex(fb, frame->rip);
-    print(fb, "\n");
-    
-    // Terminate the process
-    proc->state = PROCESS_TERMINATED;
-    
-    // Clean up and find next process
-    process_cleanup_terminated();
-    
-    // Try to switch to another process
-    process_t* next = process_get_list();
-    while (next) {
-        if (next->state == PROCESS_READY) {
-            print(fb, "Switching to process: ");
-            print(fb, next->name);
-            print(fb, "\n\n");
-            process_switch_to(next);
-            return; // Will return to the new process
-        }
-        next = next->next;
-    }
-    
-    // No other process, go back to idle/shell
-    next = process_get_list();
-    if (next && next->pid == 0) {
-        process_switch_to(next);
-    }
-}
-
 // A tiny helper the compiler knows never returns
 __attribute__((noreturn)) static void panic_halt_forever(void) {
     // Disable interrupts and halt forever
@@ -679,12 +623,6 @@ __attribute__((noreturn)) static void panic_halt_forever(void) {
 __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     struct limine_framebuffer *fb = fb0();
     if (!fb) panic_halt_forever();
-
-    // User-mode exception? Hand it off and return to the common stub.
-    if ((frame->cs & 3) == 3) {
-        handle_usermode_exception(frame);
-        return; // the scheduler/code should rewrite the frame or pick a new proc
-    }
 
     // --- Kernel-mode fault: collect extra context before drawing ---
     uint64_t cr2 = 0;
@@ -819,9 +757,6 @@ __attribute__((naked)) void exception_handler_common(void) {
     );
 }
 
-extern void timer_handler(uint64_t* interrupt_rsp);
-extern void hda_interrupt_handler(void);
-
 __attribute__((naked)) void irq0_handler(void) {
     asm volatile (
         "push %rax\n"
@@ -841,7 +776,6 @@ __attribute__((naked)) void irq0_handler(void) {
         "push %r15\n"
         
         "mov %rsp, %rdi\n"  // Pass pointer to interrupt frame
-        "call timer_handler\n"
         
         // Send EOI to PIC (AT&T: use DX as the port register)
         "mov $0x20, %al\n"
@@ -955,9 +889,6 @@ void init_idt(void) {
     
     // Timer IRQ (IRQ 0 = interrupt 32)
     idt_set_gate(32, (uint64_t)irq0_handler);
-
-    extern void syscall_handler(void);
-    idt_set_gate(0x80, (uint64_t)syscall_handler);
 
     // After setting up all exception handlers, set syscall differently:
     idt[0x80].type_attr = 0xEE; // Change to DPL=3 (ring 3 can call)
@@ -1140,40 +1071,19 @@ void wait_for_key(void) {
 void cmd_help(struct limine_framebuffer *fb) {
     print(fb, "Available commands:\n\n");
     print(fb, "  help       - Show this help message\n");
-    print(fb, "  clear      - Clear the screen\n");
+    print(fb, "  clear      - Clear the console\n");
+    print(fb, "  echo [msg] - Print a message\n");
     print(fb, "  about      - Show information about KiwiOS\n");
-    print(fb, "  echo [msg] - Print message to the screen\n");
-    print(fb, "  beep       - Play a short test tone\n");
-    print(fb, "  shutdown   - Shutdown the system\n");
-    print(fb, "  reboot     - Reboot the system\n");
-    print(fb, "  pcilist    - List PCI devices\n");
-
-    print(fb, "\n");
-
-    print(fb, "  [FILESYSTEM COMMANDS]\n");
-    print(fb, "  ls [path]       - List directory contents (default: current directory)\n");
-    print(fb, "  pwd             - Print working directory\n");
-    print(fb, "  cd [path]      - Change directory (default: /)\n");
-    print(fb, "  cat <file>     - Display file contents\n");
-    print(fb, "  run <file>     - Execute a program\n");
-    print(fb, "  touch <file>   - Create an empty file\n");
-    print(fb, "  append <file> <text> - Append text to a file\n");
-    print(fb, "  truncate <file> <size> - Truncate file to size bytes\n");
-
-    print(fb, "\n");
-
-    print(fb, "  [DEBUGGING COMMANDS]\n");
-    print(fb, "  meminfo    - Show memory information\n");
-    print(fb, "  memtest    - Run memory test\n");
-    print(fb, "  vmtest     - Run virtual memory test\n");
-    print(fb, "  heaptest   - Run heap allocation test\n");
-    print(fb, "  pslist     - List running processes\n");
-    print(fb, "  psdebug    - Show debug info for current process\n");
-    print(fb, "  kill <pid> - Terminate a running process\n");
-    print(fb, "  switch     - Switch to next process\n");
-    print(fb, "  fbinfo     - Show framebuffer information\n");
-    print(fb, "  crash [n]  - Trigger exception number n (default 0)\n");
+    print(fb, "  crash [n]  - Trigger exception number n\n");
+    print(fb, "  meminfo    - Show memory usage information\n");
+    print(fb, "  memtest    - Run a memory test\n");
+    print(fb, "  vmtest     - Run a VMM test\n");
+    print(fb, "  heaptest   - Run a heap allocation test\n");
+    print(fb, "  scale [factor] - Set framebuffer scaling factor\n");
 }
+
+// lightweight print helpers
+static void kputs(const char* s) { print(fb0(), s); }
 
 void cmd_clear(struct limine_framebuffer *fb /*unused*/) {
     (void)fb;
@@ -1194,45 +1104,6 @@ void cmd_echo(struct limine_framebuffer *fb, const char *args) {
 void cmd_about(struct limine_framebuffer *fb) {
     print(fb, "KiwiOS v0.1\n");
     print(fb, "A simple operating system\n");
-}
-
-void cmd_beep(struct limine_framebuffer *fb) {
-    (void)fb;
-
-    const uint32_t sample_rate = 48000; // matches current HDA init
-    const uint32_t duration_ms = 200;
-    const uint32_t frequency_hz = 440;
-    const int16_t amplitude = 16000;
-
-    size_t channels = HDA_output_channels();
-    if (channels == 0) {
-        print(fb0(), "[hda] no output channels available\n");
-        return;
-    }
-
-    size_t frames = (sample_rate * duration_ms) / 1000;
-    size_t samples = frames * channels;
-
-    int16_t *buffer = (int16_t *)kmalloc(samples * sizeof(int16_t));
-    if (!buffer) {
-        print(fb0(), "[hda] unable to allocate beep buffer\n");
-        return;
-    }
-
-    // Simple square wave
-    uint32_t period = sample_rate / frequency_hz;
-    if (period == 0) period = 1;
-
-    for (size_t i = 0; i < frames; i++) {
-        int16_t sample = ((i % period) < (period / 2)) ? amplitude : (int16_t)-amplitude;
-        for (size_t ch = 0; ch < channels; ch++) {
-            buffer[i * channels + ch] = sample;
-        }
-    }
-
-    HDA_enqueue_interleaved_pcm(buffer, frames);
-    extern void kfree(void *p);
-    kfree(buffer);
 }
 
 void cmd_crash(struct limine_framebuffer *fb, const char *args) {
@@ -1529,146 +1400,6 @@ void cmd_heaptest(struct limine_framebuffer *fb) {
     print(fb, "\n");
 }
 
-void test_process_1(void) {
-    struct limine_framebuffer *fb = fb0();
-    
-    for (int i = 0; i < 5; i++) {
-        print(fb, "Process 1 tick ");
-        print_hex(fb, timer_get_ticks());
-        print(fb, "\n");
-        
-        // Busy wait a bit so we can see it
-        for (volatile int j = 0; j < 10000000; j++);
-    }
-    
-    print(fb, "Process 1 done\n");
-}
-
-void test_process_2(void) {
-    struct limine_framebuffer *fb = fb0();
-    
-    for (int i = 0; i < 5; i++) {
-        print(fb, "Process 2 tick ");
-        print_hex(fb, timer_get_ticks());
-        print(fb, "\n");
-        
-        // Busy wait a bit
-        for (volatile int j = 0; j < 10000000; j++);
-    }
-    
-    print(fb, "Process 2 done\n");
-}
-
-void cmd_pslist(struct limine_framebuffer *fb) {
-    print(fb, "Process List:\n");
-    print(fb, "PID  STATE      NAME\n");
-    print(fb, "---  ---------  ----\n");
-    
-    process_t* proc = process_get_list();
-    
-    while (proc) {
-        print_hex(fb, proc->pid);
-        print(fb, "  ");
-        
-        switch (proc->state) {
-            case PROCESS_READY:
-                print(fb, "READY     ");
-                break;
-            case PROCESS_RUNNING:
-                print(fb, "RUNNING   ");
-                break;
-            case PROCESS_SLEEPING:
-                print(fb, "SLEEPING  ");
-                break;
-            case PROCESS_TERMINATED:
-                print(fb, "TERMINATED");
-                break;
-        }
-        print(fb, "  ");
-        
-        print(fb, proc->name);
-        print(fb, "\n");
-
-        proc = proc->next;
-    }
-}
-
-void cmd_kill(struct limine_framebuffer *fb, const char *args) {
-    (void)fb;
-    if (!args || !*args) { kputs("usage: kill <pid>\n"); return; }
-
-    uint32_t pid = 0;
-    while (*args == ' ') args++;
-    while (*args >= '0' && *args <= '9') {
-        pid = pid * 10 + (uint32_t)(*args - '0');
-        args++;
-    }
-
-    if (pid == 0) { kputs("kill: invalid pid\n"); return; }
-
-    if (!process_kill(pid)) {
-        kputs("kill: no such process or cannot kill\n");
-        return;
-    }
-
-    kputs("killed process\n");
-}
-
-void cmd_switch(struct limine_framebuffer *fb) {
-    process_t* current = process_current();
-    print(fb, "Current: ");
-    print(fb, current->name);
-    print(fb, " (PID ");
-    print_hex(fb, current->pid);
-    print(fb, ")\n");
-    
-    // Find next ready process
-    process_t* next = current->next;
-    if (!next) next = process_get_list();
-    
-    while (next && next != current) {
-        if (next->state == PROCESS_READY) {
-            print(fb, "Switching to: ");
-            print(fb, next->name);
-            print(fb, "\n");
-            
-            process_switch_to(next);
-            
-            // When we return here, we've been switched back
-            print(fb, "Back to: ");
-            print(fb, process_current()->name);
-            print(fb, "\n");
-            return;
-        }
-        next = next->next;
-        if (!next) next = process_get_list();
-    }
-    
-    print(fb, "No ready processes\n");
-}
-
-void cmd_psdebug(struct limine_framebuffer *fb) {
-    process_t* proc = process_get_list();
-    
-    while (proc) {
-        print(fb, "Process: ");
-        print(fb, proc->name);
-        print(fb, "\n");
-        print(fb, "  PID: ");
-        print_hex(fb, proc->pid);
-        print(fb, "\n");
-        print(fb, "  RSP: ");
-        print_hex(fb, proc->context.rsp);
-        print(fb, "\n");
-        print(fb, "  Stack Top: ");
-        print_hex(fb, proc->stack_top);
-        print(fb, "\n\n");
-        
-        proc = proc->next;
-    }
-}
-
-// --- fbinfo: list all Limine framebuffers and modes ---
 void cmd_fbinfo(struct limine_framebuffer *fb_unused) {
     (void)fb_unused;
 
@@ -1745,343 +1476,6 @@ void cmd_fbinfo(struct limine_framebuffer *fb_unused) {
     }
 }
 
-void cmd_shutdown(struct limine_framebuffer *fb) {
-    (void)fb;
-    print(NULL, "Shutting down...\n");
-    acpi_poweroff(); // no-return
-}
-
-void cmd_reboot(struct limine_framebuffer *fb) {
-    (void)fb;
-    print(NULL, "Rebooting...\n");
-    acpi_reboot(); // no-return
-}
-
-// --- vendor name lookup (common IDs only; extend as you like) ---
-static const struct { uint16_t vid; const char* name; } VENDORS[] = {
-    {0x8086,"Intel"}, {0x10DE,"NVIDIA"}, {0x1002,"AMD/ATI"}, {0x1022,"AMD"},
-    {0x1AF4,"Red Hat VirtIO"}, {0x80EE,"Oracle VirtualBox"}, {0x15AD,"VMware"},
-    {0x1234,"QEMU"}, {0x1B36,"QEMU (PCI-PCIe Bridge)"},
-    {0x10EC,"Realtek"}, {0x14E4,"Broadcom"}, {0x1B21,"ASMedia"},
-    {0x1912,"Renesas"}, {0x1B4B,"Marvell"}, {0,0}
-};
-static const char* vendor_name(uint16_t vid){
-    for (int i=0; VENDORS[i].name; ++i) if (VENDORS[i].vid==vid) return VENDORS[i].name;
-    return "UnknownVendor";
-}
-
-// --- class/subclass/progif decoding (condensed, common cases) ---
-static const char* class_name(uint8_t cc){
-    switch(cc){
-        case 0x00: return "Unclassified";
-        case 0x01: return "Mass Storage";
-        case 0x02: return "Network";
-        case 0x03: return "Display";
-        case 0x04: return "Multimedia";
-        case 0x05: return "Memory";
-        case 0x06: return "Bridge";
-        case 0x07: return "Comm";
-        case 0x08: return "Base System";
-        case 0x09: return "Input";
-        case 0x0A: return "Docking";
-        case 0x0B: return "Processor";
-        case 0x0C: return "Serial Bus";
-        case 0x0D: return "Wireless";
-        case 0x0E: return "I/O";
-        case 0x0F: return "Satellite";
-        case 0x10: return "Encryption";
-        case 0x11: return "Signal Proc";
-        case 0x12: return "Proc Accel";
-        case 0x13: return "Non-Essent";
-        case 0x40: return "Co-processor";
-        case 0xFF: return "Unassigned";
-        default:   return "Class?";
-    }
-}
-static const char* subclass_name(uint8_t cc, uint8_t sc){
-    switch (cc){
-        case 0x01: // Mass Storage
-            switch(sc){
-                case 0x00: return "SCSI";
-                case 0x01: return "IDE";
-                case 0x02: return "Floppy";
-                case 0x03: return "IPI";
-                case 0x04: return "RAID";
-                case 0x05: return "ATA";
-                case 0x06: return "SATA";
-                case 0x07: return "SAS";
-                case 0x08: return "NVMHCI";
-                case 0x09: return "NVM Express";
-                default:   return "Storage?";
-            }
-        case 0x02: return (sc==0x00)?"Ethernet":(sc==0x80)?"OtherNet":"Net?";
-        case 0x03: return (sc==0x00)?"VGA":(sc==0x02)?"3D":"Display?";
-        case 0x04:
-            switch(sc){
-                case 0x00: return "Multimedia Dev";
-                case 0x01: return "Audio (Legacy)";
-                case 0x02: return "Telephony";
-                case 0x03: return "High Def Audio"; // Intel HDA
-                case 0x04: return "Video Ctrl";
-                default:   return "Multimedia?";
-            }
-        case 0x06:
-            switch(sc){
-                case 0x00: return "Host Bridge";
-                case 0x01: return "ISA Bridge";
-                case 0x04: return "PCI-PCI Bridge";
-                case 0x07: return "CardBus";
-                case 0x09: return "PCI-PCI Bridge";
-                default:   return "Bridge?";
-            }
-        case 0x08:
-            switch(sc){
-                case 0x00: return "PIC";
-                case 0x01: return "DMA";
-                case 0x02: return "Timer";
-                case 0x03: return "RTC";
-                case 0x04: return "PCI Hotplug";
-                case 0x05: return "SD Host";
-                default:   return "BaseSys?";
-            }
-        case 0x09:
-            switch(sc){
-                case 0x00: return "Keyboard";
-                case 0x01: return "Digitizer";
-                case 0x02: return "Mouse";
-                case 0x03: return "Scanner";
-                case 0x04: return "Gameport";
-                default:   return "Input?";
-            }
-        case 0x0C: // Serial Bus
-            switch(sc){
-                case 0x00: return "FireWire";
-                case 0x01: return "ACCESS.bus";
-                case 0x02: return "SSA";
-                case 0x03: return "USB";
-                case 0x05: return "SMBus";
-                default:   return "SerialBus?";
-            }
-        default: return "Subclass?";
-    }
-}
-static const char* progif_name(uint8_t cc, uint8_t sc, uint8_t pi){
-    if (cc==0x0C && sc==0x03){ // USB
-        switch(pi){
-            case 0x00: return "UHCI";
-            case 0x10: return "OHCI";
-            case 0x20: return "EHCI";
-            case 0x30: return "XHCI";
-            case 0x80: return "UnspecUSB";
-            case 0xFE: return "USB Device";
-        }
-    }
-    if (cc==0x01 && sc==0x06){ // SATA
-        return (pi==0x01)?"AHCI":"SATA";
-    }
-    if (cc==0x04 && sc==0x03){ // HDA
-        return "HDA";
-    }
-    return "";
-}
-
-// --- pretty printer command ---
-void cmd_pcilist(struct limine_framebuffer *fb) {
-    pci_device_t devs[256];
-    int n = pci_enum_devices(devs, 256);
-
-    print(fb, "Bus:Dev.F  VID:DID   CC.SC.IF  Vendor              -> Device\n");
-    print(fb, "---------------------------------------------------------------\n");
-
-    int shown = 0;
-    for (int i = 0; i < n; ++i) {
-        pci_device_t* d = &devs[i];
-        // BDF
-        hx2(fb, d->bus); print(fb, ":"); hx2(fb, d->slot); print(fb, "."); hx2(fb, d->func); print(fb, "  ");
-        // VID:DID
-        hx4(fb, d->vendor_id); print(fb, ":"); hx4(fb, d->device_id); print(fb, "  ");
-        // CC.SC.IF
-        hx2(fb, d->class_code); print(fb, "."); hx2(fb, d->subclass); print(fb, "."); hx2(fb, d->prog_if); print(fb, "  ");
-
-        const char* vname = vendor_name(d->vendor_id);
-        const char* cname = class_name(d->class_code);
-        const char* sname = subclass_name(d->class_code, d->subclass);
-        const char* pname = progif_name(d->class_code, d->subclass, d->prog_if);
-
-        print(fb, vname); print(fb, "              "); // crude spacing
-        print(fb, "-> ");
-
-        // Compose a readable device type
-        if (d->class_code==0x04 && d->subclass==0x03) {
-            // Make HDA pop
-            print(fb, "High Definition Audio");
-            if (d->vendor_id==0x8086) print(fb, " (Intel HDA)");
-        } else {
-            print(fb, cname); print(fb, " / "); print(fb, sname);
-            if (pname[0]) { print(fb, " ("); print(fb, pname); print(fb, ")"); }
-        }
-
-        print(fb, "\n");
-        if (++shown >= 256) break; // safety
-    }
-
-    print(fb, "---------------------------------------------------------------\n");
-    print(fb, "Total devices listed: "); print_hex(fb, (uint64_t)shown); print(fb, "\n");
-}
-
-// lightweight print helpers
-static void kputs(const char* s) { print(fb0(), s); }
-
-// FS globals
-static ext2_fs_t* g_fs = NULL;
-
-// bootstrap: ATA â†’ first MBR partition â†’ ext2 mount and chdir("/")
-static void fs_init(void) {
-    block_device_t* root = blockdev_get_root();
-    if (!root) { kputs("[disk] no block devices found (AHCI/ATA).\n"); return; }
-
-    block_device_t* part = mbr_open_first_partition(root);
-    block_device_t* vol  = part ? part : root;
-
-    g_fs = ext2_mount(vol);
-    if (!g_fs) {
-        kputs("[ext2] mount failed. Is the device/partition ext2?\n");
-        return;
-    }
-    (void)ext2_chdir(g_fs, "/");
-    kputs("[ext2] mounted and set cwd to /\n");
-}
-
-
-// ls [path]
-static void _ls_cb(const ext2_dirent_t* e, void* user) {
-    (void)user;
-    // Preserve current colors so ls does not leak styling into the shell.
-    uint32_t prev_fg = fg_color;
-    uint32_t prev_bg = bg_color;
-
-    // ext2_dirent_t uses file_type: 1=regular, 2=directory
-    if (e->file_type == 2) {
-        fg_color = ansi_palette[12]; // bright blue for directories
-        print(fb0(), e->name);
-    } else {
-        fg_color = ansi_palette[6]; // default color for regular files and others
-        print(fb0(), e->name);
-    }
-
-    // Restore prior colors for subsequent output.
-    fg_color = prev_fg;
-    bg_color = prev_bg;
-    print(fb0(), "\n");
-}
-
-// take an optional path (args may be NULL/"")
-void cmd_ls(struct limine_framebuffer* fb, const char* path) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    const char* p = (path && *path) ? path : ".";
-    ext2_listdir(g_fs, p, _ls_cb, NULL);
-}
-
-void cmd_pwd(struct limine_framebuffer* fb) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    kputs(ext2_get_cwd()); kputs("\n");
-}
-
-void cmd_cd(struct limine_framebuffer* fb, const char* args) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    const char* path = (args && *args) ? args : "/";
-    if (!ext2_chdir(g_fs, path)) kputs("cd: no such dir\n");
-}
-
-void cmd_cat(struct limine_framebuffer* fb, const char* args) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!args || !*args) { kputs("usage: cat <file>\n"); return; }
-    size_t sz = 0;
-    void* data = ext2_read_entire_file(g_fs, args, &sz);
-    if (!data) { kputs("cat: cannot read file\n"); return; }
-    char* c = (char*)data;
-    for (size_t i = 0; i < sz; i++) {
-        char ch = c[i];
-        if (ch == '\0') ch = '\n';
-        char s[2] = { ch, 0 };
-        print(fb0(), s);
-    }
-    extern void kfree(void* p);
-    kfree(data);
-}
-
-void cmd_touch(struct limine_framebuffer* fb, const char* args) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!args || !*args) { kputs("usage: touch <file>\n"); return; }
-    if (!ext2_create_empty(g_fs, args, 0644)) kputs("touch: failed\n");
-}
-
-// append <file> <text...>  (dispatcher already splits path/text)
-void cmd_append(struct limine_framebuffer* fb, const char* path, const char* text) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!path || !*path) { kputs("usage: append <file> <text>\n"); return; }
-    if (!text) text = "";
-    if (!ext2_append(g_fs, path, text, (uint32_t)strlen(text))) kputs("append: failed\n");
-}
-
-// truncate <file> <size>  (dispatcher parses size_t for you)
-void cmd_truncate(struct limine_framebuffer* fb, const char* path, size_t new_size) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!path || !*path) { kputs("usage: truncate <file> <size>\n"); return; }
-    if (!ext2_truncate(g_fs, path, (uint32_t)new_size)) kputs("truncate: failed\n");
-}
-
-void cmd_run(struct limine_framebuffer* fb, const char* args) {
-    (void)fb;
-    if (!g_fs) { kputs("[ext2] not mounted.\n"); return; }
-    if (!args || !*args) { kputs("usage: run <file.elf> [args...]\n"); return; }
-
-    const char* p = args;
-    char prog[256]; size_t n=0;
-    while (*p && *p!=' ' && n < sizeof(prog)-1) { prog[n++]=*p++; }
-    prog[n]='\0';
-
-    int argc = 0; const char* argv_arr[8];
-    argv_arr[argc++] = prog;
-    while (*p==' ') p++;
-    while (*p && argc < 8) {
-        argv_arr[argc++] = p;
-        while (*p && *p!=' ') p++;
-        if (*p==' ') { *((char*)p) = '\0'; p++; while (*p==' ') p++; }
-    }
-
-    size_t fsz = 0;
-    void* data = ext2_read_entire_file(g_fs, prog, &fsz);
-    if (!data) { kputs("run: cannot read file\n"); return; }
-    if (!elf_validate(data, fsz)) { kputs("run: not a valid ELF64\n"); extern void kfree(void*); kfree(data); return; }
-
-    process_t* proc = elf_load_with_args(prog, data, fsz, argc, argv_arr);
-    extern void kfree(void*);
-    kfree(data);
-    if (!proc) { kputs("run: load failed\n"); return; }
-    kputs("started process: "); kputs(proc->name); kputs("\n");
-    process_switch_to(proc);
-}
-
-static void print_prompt(void) {
-    const char *cwd = "/";
-    if (g_fs) {
-        const char *fs_cwd = ext2_get_cwd();
-        if (fs_cwd && *fs_cwd) cwd = fs_cwd;
-    }
-
-    print(NULL, "\x1b[32m");
-    print(NULL, cwd);
-    print(NULL, "\x1b[0m > ");
-}
-
 void cmd_scale(struct limine_framebuffer *fb, const char *args) {
     (void)fb;
     // parse unsigned int from args; default 1 if missing/invalid
@@ -2094,7 +1488,7 @@ void cmd_scale(struct limine_framebuffer *fb, const char *args) {
         }
     }
     if (s == 0) s = 1;
-    if (s > 16) s = 16;
+    if (s > 16) s = 9;
 
     console_set_scale(s);
 
@@ -2129,14 +1523,7 @@ struct command commands[] = {
     {"memtest", cmd_memtest},
     {"vmtest", cmd_vmtest},
     {"heaptest", cmd_heaptest},
-    {"pslist", cmd_pslist},
-    {"psdebug", cmd_psdebug},
-    {"switch", cmd_switch},
     {"fbinfo", cmd_fbinfo},
-    {"beep", cmd_beep},
-    {"reboot",   cmd_reboot},
-    {"shutdown", cmd_shutdown},
-    {"pcilist", cmd_pcilist},
     {NULL, NULL} // Sentinel
 };
 
@@ -2168,38 +1555,6 @@ void execute_command(struct limine_framebuffer *fb, char *input) {
         cmd_crash(fb, args);
         return;
     }
-
-    if (strcmp(input, "ls") == 0)    { cmd_ls(fb, (args && *args) ? args : "."); return; }
-    if (strcmp(input, "pwd") == 0)   { cmd_pwd(fb); return; }
-    if (strcmp(input, "cd") == 0)    { cmd_cd(fb, (args && *args) ? args : "/"); return; }
-    if (strcmp(input, "cat") == 0)   { cmd_cat(fb, args); return; }
-    if (strcmp(input, "run") == 0)   { cmd_run(fb, args); return; }
-    if (strcmp(input, "touch") == 0) { cmd_touch(fb, args); return; }
-
-    if (strcmp(input, "append") == 0) {
-        if (!args || !*args) { print(fb0(), "usage: append <path> <text>\n"); return; }
-        char *p = args;
-        while (*p && *p != ' ') p++;
-        char *text = "";
-        if (*p) { *p++ = '\0'; while (*p == ' ') p++; text = p; }
-        cmd_append(fb, args, text);
-        return;
-    }
-
-    if (strcmp(input, "truncate") == 0) {
-        if (!args || !*args) { print(fb0(), "usage: truncate <file> <size>\n"); return; }
-        char *p = args;
-        while (*p && *p != ' ') p++;
-        if (!*p) { print(fb0(), "usage: truncate <file> <size>\n"); return; }
-        *p++ = '\0'; while (*p == ' ') p++;
-        size_t n = 0; while (*p >= '0' && *p <= '9') { n = n*10 + (*p - '0'); p++; }
-        cmd_truncate(fb, args, n);
-        return;
-    }
-
-    if (strcmp(input, "kill") == 0)   { cmd_kill(fb, args); return; }
-
-    
 
     if (strcmp(input, "scale") == 0) { cmd_scale(fb, args); return; }
 
@@ -2278,7 +1633,7 @@ void shell_loop(struct limine_framebuffer *fb) {
 
     print(fb, "Welcome to kiwiOS!\n");
     print(fb, "Type 'help' for available commands\n\n");
-    print_prompt();
+    print(fb, "> ");
     
     while (1) {
         char c = keyboard_getchar();
@@ -2322,8 +1677,8 @@ void shell_loop(struct limine_framebuffer *fb) {
             
             // Reset for next command
             input_pos = 0;
+            print(fb, "> ");
             reset_history_navigation();
-            print_prompt();
         } else if (c == '\b') {
             // Backspace
             if (input_pos > 0) {
@@ -2336,11 +1691,6 @@ void shell_loop(struct limine_framebuffer *fb) {
             putc_fb(fb, c);
         }
     }
-}
-
-static void shell_process_main(void) {
-    struct limine_framebuffer *fb = fb0();
-    shell_loop(fb);
 }
 
 // Enable x86_64 FPU/SSE for both kernel and userspace.
@@ -2387,8 +1737,6 @@ void kmain(void) {
     tss_init();
     gdt_init();
     x86_enable_sse();
-    syscall_init();
-    acpi_init();
 
     if (memmap_request.response != NULL) {
         pmm_init(memmap_request.response);
@@ -2396,8 +1744,6 @@ void kmain(void) {
 
     vmm_init();
     heap_init();
-    process_init();
-    scheduler_init();
 
     // Initialize PIC (Programmable Interrupt Controller)
     outb(0x20, 0x11);
@@ -2413,42 +1759,14 @@ void kmain(void) {
     outb(0x21, 0xFF);
     outb(0xA1, 0xFF);
 
-    // Initialize timer at 100 Hz
-    timer_init(100);
-
     // Unmask only IRQ0 (timer)
     outb(0x21, 0xFE);
 
     // Enable interrupts
     asm volatile ("sti");
 
-    // Initialize Intel High Definition Audio (best-effort)
-    hda_init();
-
-    // === Block device and disk driver initialization ===
-    blockdev_init();
-
-    int ahci_disks = ahci_init();
-    if (ahci_disks > 0) {
-        kputs("AHCI: ");
-        print_hex(fb0(), (uint64_t)ahci_disks);
-        kputs(" SATA device(s) detected\n");
-    } else {
-        kputs("AHCI: No devices found, falling back to ATA\n");
-        ata_init();
-    }
-
-    // Initialize filesystem from first available block device
-    fs_init();
-
-    process_t* shell_proc = process_create("shell", shell_process_main);
-    if (shell_proc) {
-        process_switch_to(shell_proc);
-    } else {
-        // Fallback to direct shell if allocation fails
-        shell_loop(fb);
-    }
-
+    shell_loop(fb);
+    
     // We should never return here; halt if we do.
     while (1) { asm volatile ("hlt"); }
 }

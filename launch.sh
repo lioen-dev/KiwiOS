@@ -12,8 +12,6 @@ cd "/mnt/c/Program Files/qemu/"
   -device ich9-ahci,id=ahci0 \
   -drive id=disk,file="$WIN_EXT2_IMG",if=none,format=raw,media=disk \
   -device ide-hd,drive=disk,bus=ahci0.0 \
-  -device ich9-intel-hda \
-  -device hda-duplex \
   -cdrom "$WIN_IMAGE" \
   -boot order=d \
  
