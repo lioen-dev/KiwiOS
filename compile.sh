@@ -2,19 +2,14 @@
 rm -rf bin iso_root obj kiwi.img kiwiOS.iso
 bash rmindentifier.sh
 
-# Compile filesystem initrd
-cd initrd
-bash elf.sh
-cd ..
 
-bash ext2.sh initrd kiwi.img
 
 make
 # Download the latest Limine binary release for the 10.x branch, only if it doesn't exist.
 
 if [ ! -d "limine" ]; then
   echo "[*] Cloning Limine bootloader..."
-  git clone https://codeberg.org/Limine/Limine.git limine --branch=v10.x-binary --depth=1
+  git clone https://codeberg.org/Limine/Limine.git limine --branch=v10.3.0-binary --depth=1
 fi
 
 # Build "limine" utility.

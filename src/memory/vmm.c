@@ -1,7 +1,7 @@
 #include "memory/vmm.h"
 #include "memory/pmm.h"
 #include "memory/heap.h"
-#include "lib/string.h"
+#include "libc/string.h"
 #include <stdint.h>
 #include <stdbool.h>
 

@@ -1,7 +1,8 @@
 #include <stddef.h>
 #include <stdint.h>
-#include "lib/string.h"
+#include "libc/string.h"
 #include "arch/x86/tss.h"
+#include "libc/stdio.h"
 
 typedef struct {
     uint16_t limit_low;

@@ -1,7 +1,7 @@
 #include "arch/x86/tss.h"
 #include <stddef.h>
 #include <stdint.h>
-#include "lib/string.h"
+#include "libc/string.h"
 
 tss_t tss;
 

@@ -5,7 +5,7 @@
 #include "core/console.h"
 #include "core/keyboard.h"
 #include "core/log.h"
-#include "lib/string.h"
+#include "libc/string.h"
 #include "memory/heap.h"
 #include "memory/pmm.h"
 #include "memory/vmm.h"
@@ -492,26 +492,22 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
     
     if (strcmp(input, "echo") == 0) {
         cmd_echo(fb, args);
-        log_info("shell", "echo command executed");
         return;
     }
     
     if (strcmp(input, "crash") == 0) {
         cmd_crash(fb, args);
-        log_info("shell", "forced exception triggered");
         return;
     }
 
     if (strcmp(input, "scale") == 0) {
         cmd_scale(fb, args);
-        log_info("shell", "console scale changed");
         return;
     }
 
     for (int i = 0; commands[i].name != NULL; i++) {
         if (strcmp(input, commands[i].name) == 0) {
             commands[i].func(fb);
-            log_info("shell", "command executed");
             return;
         }
     }
@@ -580,11 +576,11 @@ static void replace_input_line(struct limine_framebuffer *fb,
 void shell_loop(struct limine_framebuffer *fb) {
     char input_buffer[INPUT_BUFFER_SIZE];
     int input_pos = 0;
-
+    log_info("shell", "interactive shell started");
+    
     print(fb, "Welcome to kiwiOS!\n");
     print(fb, "Type 'help' for available commands\n\n");
     print(fb, "> ");
-    log_info("shell", "interactive shell started");
     
     while (1) {
         char c = keyboard_getchar();

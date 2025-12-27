@@ -10,7 +10,7 @@
 #include "core/keyboard.h"
 #include "core/log.h"
 #include "core/shell.h"
-#include "lib/string.h"
+#include "libc/string.h"
 #include "memory/heap.h"
 #include "memory/hhdm.h"
 #include "memory/pmm.h"

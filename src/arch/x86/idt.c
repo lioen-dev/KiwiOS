@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include "arch/x86/idt.h"
 #include "core/console.h"
-#include "lib/string.h"
+#include "libc/string.h"
 
 // ================= IDT (Interrupt Descriptor Table) =================
 struct idt_entry {
@@ -75,10 +75,9 @@ __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     uint32_t old_fg, old_bg;
     console_get_colors(&old_fg, &old_bg);
 
-    // Reset scrollback first (it restores DEFAULT colors), then set
-    // the panic colors so they are used for clearing and rendering.
-    console_reset_scrollback();
+    // Set panic colors, then reset scrollback so the buffer uses panic colors
     console_set_colors(0x00FFFFFF, 0x00913030);
+    console_reset_scrollback();
 
     // Ensure the scrollback buffer's visible lines use the panic bg
     console_clear_outputs();

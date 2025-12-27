@@ -4,7 +4,7 @@
 #include "core/boot.h"
 #include "core/console.h"
 #include "font8x16_tandy2k.h"
-#include "lib/string.h"
+#include "libc/string.h"
 
 // ================= Framebuffer helpers =================
 struct limine_framebuffer *console_primary_framebuffer(void) {
@@ -164,8 +164,6 @@ static void clear_line(uint32_t logical_line) {
 }
 
 static void reset_scrollback(void) {
-    fg_color = DEFAULT_FG;
-    bg_color = DEFAULT_BG;
     ansi_reset_state();
 
     g_head = 0;
@@ -205,9 +203,9 @@ static void clear_outputs(void) {
         struct limine_framebuffer *out = g_fbs[i];
         uint8_t *base = (uint8_t *)(uintptr_t)out->address;
         size_t pitch = (size_t)out->pitch;
-        for (uint32_t y = 0; y < g_text_h_px; y++) {
+        for (uint32_t y = 0; y < out->height; y++) {
             uint8_t *row = base + (size_t)y * pitch;
-            fill_row_span(row, g_text_w_px, bg_color);
+            fill_row_span(row, (uint32_t)out->width, bg_color);
         }
     }
 }
@@ -344,7 +342,7 @@ void console_page_down(void) {
 // Public: allow shell to change scale
 void console_set_scale(uint32_t new_scale) {
     if (new_scale == 0) new_scale = 1;
-    if (new_scale > 16) new_scale = 16;
+    if (new_scale > 16) new_scale = 9;
     if (new_scale == g_scale) return;
 
     g_scale = new_scale;

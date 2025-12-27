@@ -1,6 +1,6 @@
 #include "memory/pmm.h"
 #include "limine.h"
-#include "lib/string.h"
+#include "libc/string.h"
 #include "memory/hhdm.h"
 #include <stdint.h>
 #include <stddef.h>
